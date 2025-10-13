@@ -57,6 +57,11 @@ where
             _marker: std::marker::PhantomData,
         }
     }
+
+    /// Access the lens that this mapped signal was created from.
+    pub fn source_lens(&self) -> &V {
+        &self.value
+    }
 }
 
 impl<V, O, F, FMut> Readable for MappedMutSignal<O, V, F, FMut>

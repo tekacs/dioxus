@@ -154,6 +154,18 @@ mod macro_tests {
         let second: String = second();
     }
 
+    fn derive_struct_aliases() {
+        #[derive(Store)]
+        struct AliasDemo {
+            count: usize,
+        }
+
+        let store = use_store(|| AliasDemo { count: 5 });
+        let count: AliasDemoCountStore<_> = store.count();
+        let value: usize = count();
+        assert_eq!(value, 5);
+    }
+
     fn derive_enum() {
         #[derive(Store, PartialEq, Clone, Debug)]
         #[non_exhaustive]

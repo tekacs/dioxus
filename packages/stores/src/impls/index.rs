@@ -6,7 +6,11 @@ use std::{
     ops::{self, Index, IndexMut},
 };
 
-use crate::{scope::SelectorScope, store::Store, ReadStore};
+use crate::{
+    scope::SelectorScope,
+    store::{Store, StoreLensKey, StoreLensParent},
+    ReadStore,
+};
 use dioxus_signals::{
     AnyStorage, BorrowError, BorrowMutError, ReadSignal, Readable, UnsyncStorage, Writable,
     WriteLock, WriteSignal,
@@ -170,5 +174,25 @@ where
             .into_selector()
             .map_writer(|writer| ReadSignal::new(writer))
             .into()
+    }
+}
+
+impl<Index: Clone, Write> StoreLensKey for IndexWrite<Index, Write> {
+    type Key = Index;
+
+    fn lens_key(&self) -> Self::Key {
+        self.index.clone()
+    }
+}
+
+impl<Index, Write> StoreLensParent for IndexWrite<Index, Write>
+where
+    Write: Readable + Clone,
+{
+    type ParentLens = Write;
+    type ParentTarget = <Write as Readable>::Target;
+
+    fn parent_lens(&self) -> Self::ParentLens {
+        self.write.clone()
     }
 }

@@ -1,6 +1,9 @@
+use crate::impls::{
+    btreemap::GetWrite as BTreeMapGetWrite, hashmap::GetWrite as HashMapGetWrite, index::IndexWrite,
+};
 use crate::{
     scope::SelectorScope,
-    subscriptions::{StoreSubscriptions, TinyVec},
+    subscriptions::{PathKey, StoreSubscriptions, TinyVec},
 };
 use dioxus_core::{
     use_hook, AttributeValue, DynamicNode, IntoAttributeValue, IntoDynNode, Subscribers, SuperInto,
@@ -26,6 +29,35 @@ pub type ReadStore<T, S = UnsyncStorage> = Store<T, ReadSignal<T, S>>;
 
 /// A type alias for a boxed writable-only store.
 pub type WriteStore<T, S = UnsyncStorage> = Store<T, WriteSignal<T, S>>;
+
+/// Trait implemented by lenses that retain access to their parent lens.
+pub trait StoreLensParent {
+    /// The lens type for the parent store.
+    type ParentLens;
+    /// The parent store's underlying target type.
+    type ParentTarget: ?Sized;
+
+    /// Return the parent lens.
+    fn parent_lens(&self) -> Self::ParentLens;
+}
+
+/// Trait implemented by lenses that can report their logical key/index within the parent.
+pub trait StoreLensKey {
+    /// The logical key/index type.
+    type Key: Clone;
+
+    /// Return the key/index associated with this lens.
+    fn lens_key(&self) -> Self::Key;
+}
+
+/// Type alias for stores scoped via an index-based selector.
+pub type IndexedStoreItem<T, Index, Lens> = Store<T, IndexWrite<Index, Lens>>;
+
+/// Type alias for stores scoped via a hash-map style selector.
+pub type HashMapStoreItem<T, Key, Lens> = Store<T, HashMapGetWrite<Key, Lens>>;
+
+/// Type alias for stores scoped via a BTreeMap style selector.
+pub type BTreeMapStoreItem<T, Key, Lens> = Store<T, BTreeMapGetWrite<Key, Lens>>;
 
 /// Stores are a reactive type built for nested data structures. Each store will lazily create signals
 /// for each field/member of the data structure as needed.
@@ -150,6 +182,11 @@ impl<T: ?Sized, Lens> Store<T, Lens> {
     pub fn into_selector(self) -> SelectorScope<Lens> {
         self.selector
     }
+
+    /// Return the hashed path key (if any) that identifies this store within its parent scope.
+    pub fn parent_path_key(&self) -> Option<PathKey> {
+        self.selector.path().last()
+    }
 }
 
 impl<T: ?Sized, Lens> From<SelectorScope<Lens>> for Store<T, Lens> {
@@ -181,6 +218,60 @@ where
     }
 }
 impl<T: ?Sized, Lens> Copy for Store<T, Lens> where Lens: Copy {}
+
+impl<T: ?Sized, Lens> Store<T, Lens>
+where
+    Lens: StoreLensParent,
+    <Lens as StoreLensParent>::ParentTarget: 'static,
+    <Lens as StoreLensParent>::ParentLens:
+        Readable<Target = <Lens as StoreLensParent>::ParentTarget> + 'static,
+{
+    /// Construct a store handle to the parent scope that produced this store.
+    pub fn parent_store(
+        &self,
+    ) -> Option<Store<<Lens as StoreLensParent>::ParentTarget, <Lens as StoreLensParent>::ParentLens>>
+    {
+        let mut path = self.selector.path();
+        path.pop()?;
+        let parent_selector = SelectorScope::new(
+            path,
+            self.selector.store(),
+            self.selector.lens().parent_lens(),
+        );
+        Some(parent_selector.into())
+    }
+}
+
+impl<T: ?Sized, Lens> Store<T, Lens>
+where
+    Lens: StoreLensKey,
+{
+    /// Return the logical key/index for this store within its parent.
+    pub fn key(&self) -> <Lens as StoreLensKey>::Key {
+        self.selector.lens().lens_key()
+    }
+}
+
+impl<T: ?Sized, Lens> Store<T, Lens>
+where
+    Lens: StoreLensParent + StoreLensKey,
+    <Lens as StoreLensParent>::ParentTarget: 'static,
+    <Lens as StoreLensParent>::ParentLens:
+        Readable<Target = <Lens as StoreLensParent>::ParentTarget> + 'static,
+{
+    /// Invoke a callback with the parent store and this store's key/index.
+    pub fn with_parent<R>(
+        &self,
+        mut f: impl FnMut(
+            <Lens as StoreLensKey>::Key,
+            Store<<Lens as StoreLensParent>::ParentTarget, <Lens as StoreLensParent>::ParentLens>,
+        ) -> R,
+    ) -> Option<R> {
+        let parent = self.parent_store()?;
+        let key = self.key();
+        Some(f(key, parent))
+    }
+}
 
 impl<__F, __FMut, T: ?Sized, S, Lens> ::std::convert::From<MappedStore<T, Lens, __F, __FMut>>
     for WriteStore<T, S>
@@ -434,5 +525,17 @@ pub type GlobalStore<T> = Global<Store<T>, T>;
 impl<T: 'static> InitializeFromFunction<T> for Store<T> {
     fn initialize_from_function(f: fn() -> T) -> Self {
         Store::new(f())
+    }
+}
+
+impl<T: ?Sized, Lens, F, FMut> StoreLensParent for MappedMutSignal<T, Lens, F, FMut>
+where
+    Lens: Readable + Clone,
+{
+    type ParentLens = Lens;
+    type ParentTarget = <Lens as Readable>::Target;
+
+    fn parent_lens(&self) -> Self::ParentLens {
+        self.source_lens().clone()
     }
 }

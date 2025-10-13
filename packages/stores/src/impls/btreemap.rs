@@ -2,7 +2,10 @@
 
 use std::{borrow::Borrow, collections::BTreeMap, hash::Hash, iter::FusedIterator};
 
-use crate::{store::Store, ReadStore};
+use crate::{
+    store::{Store, StoreLensKey, StoreLensParent},
+    ReadStore,
+};
 use dioxus_signals::{
     AnyStorage, BorrowError, BorrowMutError, ReadSignal, Readable, ReadableExt, UnsyncStorage,
     Writable, WriteLock, WriteSignal,
@@ -364,5 +367,25 @@ where
             .into_selector()
             .map_writer(|writer| ReadSignal::new(writer))
             .into()
+    }
+}
+
+impl<Index: Clone, Write> StoreLensKey for GetWrite<Index, Write> {
+    type Key = Index;
+
+    fn lens_key(&self) -> Self::Key {
+        self.index.clone()
+    }
+}
+
+impl<Index, Write> StoreLensParent for GetWrite<Index, Write>
+where
+    Write: Readable + Clone,
+{
+    type ParentLens = Write;
+    type ParentTarget = <Write as Readable>::Target;
+
+    fn parent_lens(&self) -> Self::ParentLens {
+        self.write.clone()
     }
 }

@@ -167,6 +167,27 @@ impl TinyVec {
             panic!("SelectorPath is full");
         }
     }
+
+    pub(crate) const fn is_empty(&self) -> bool {
+        self.length == 0
+    }
+
+    pub(crate) fn last(&self) -> Option<u16> {
+        if self.is_empty() {
+            None
+        } else {
+            Some(self.path[self.length - 1])
+        }
+    }
+
+    pub(crate) fn pop(&mut self) -> Option<u16> {
+        if self.is_empty() {
+            None
+        } else {
+            self.length -= 1;
+            Some(self.path[self.length])
+        }
+    }
 }
 
 impl Deref for TinyVec {

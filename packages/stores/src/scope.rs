@@ -82,6 +82,18 @@ impl<Lens> SelectorScope<Lens> {
         Self { path, store, write }
     }
 
+    pub(crate) fn path(&self) -> TinyVec {
+        self.path
+    }
+
+    pub(crate) fn store(&self) -> StoreSubscriptions {
+        self.store
+    }
+
+    pub(crate) fn lens(&self) -> &Lens {
+        &self.write
+    }
+
     /// Create a child selector scope for a hash key. The scope will only be marked as dirty when a
     /// write occurs to that key or its parents.
     ///

@@ -62,11 +62,14 @@ fn derive_store_struct(
     let (_, ty_generics, _) = generics.split_for_impl();
     let (extension_impl_generics, extension_generics, extension_where_clause) =
         extension_generics.split_for_impl();
+    let alias_generics = extension_impl_generics.to_token_stream();
+    let alias_where = extension_where_clause.map(|clause| clause.to_token_stream());
 
     // We collect the definitions and implementations for the extension trait methods along with the types of the fields in the transposed struct
     let mut implementations = Vec::new();
     let mut definitions = Vec::new();
     let mut transposed_fields = Vec::new();
+    let mut type_aliases = Vec::new();
 
     for (field_index, field) in fields.iter().enumerate() {
         generate_field_methods(
@@ -77,6 +80,10 @@ fn derive_store_struct(
             &mut transposed_fields,
             &mut definitions,
             &mut implementations,
+            &mut type_aliases,
+            visibility,
+            &alias_generics,
+            &alias_where,
         );
     }
 
@@ -133,6 +140,9 @@ fn derive_store_struct(
 
     // Expand to the extension trait and its implementation for the store alongside the transposed struct
     Ok(quote! {
+        #(
+            #type_aliases
+        )*
         #visibility trait #extension_trait_name #extension_impl_generics #extension_where_clause {
             #(
                 #definitions
@@ -157,6 +167,10 @@ fn generate_field_methods(
     transposed_fields: &mut Vec<TokenStream2>,
     definitions: &mut Vec<TokenStream2>,
     implementations: &mut Vec<TokenStream2>,
+    type_aliases: &mut Vec<TokenStream2>,
+    visibility: &syn::Visibility,
+    alias_generics: &TokenStream2,
+    alias_where: &Option<TokenStream2>,
 ) {
     let vis = &field.vis;
     let field_name = &field.ident;
@@ -172,6 +186,12 @@ fn generate_field_methods(
     let store_type = mapped_type(struct_name, ty_generics, field_type);
 
     transposed_fields.push(quote! { #vis #field_name #colon #store_type });
+
+    let alias_suffix = function_name.to_string().to_case(Case::UpperCamel);
+    let alias_ident = format_ident!("{}{}Store", struct_name, alias_suffix);
+    if alias_where.is_none() {
+        type_aliases.push(quote! { #visibility type #alias_ident #alias_generics = #store_type; });
+    }
 
     // Each field gets its own reactive scope within the child based on the field's index
     let ordinal = LitInt::new(&field_index.to_string(), field.span());
