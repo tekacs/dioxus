@@ -1,10 +1,10 @@
 use super::{AppBuilder, ServeUpdate, WebServer};
 use crate::{
-    platform_override::CommandWithPlatformOverrides, BuildArtifacts, BuildId, BuildMode,
-    BuildTargets, BuilderUpdate, BundleFormat, HotpatchModuleCache, Result, ServeArgs, TailwindCli,
-    TraceSrc, Workspace,
+    BuildArtifacts, BuildId, BuildMode, BuildTargets, BuilderUpdate, BundleFormat,
+    HotpatchModuleCache, Result, ServeArgs, TailwindCli, TraceSrc, Workspace,
+    platform_override::CommandWithPlatformOverrides,
 };
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use dioxus_core::internal::{
     HotReloadTemplateWithLocation, HotReloadedTemplate, TemplateGlobalKey,
 };
@@ -14,12 +14,12 @@ use dioxus_html::HtmlCtx;
 use dioxus_rsx::CallBody;
 use dioxus_rsx_hotreload::{ChangedRsx, HotReloadResult};
 use futures_channel::mpsc::{UnboundedReceiver, UnboundedSender};
-use futures_util::future::OptionFuture;
 use futures_util::StreamExt;
+use futures_util::future::OptionFuture;
 use krates::NodeId;
 use notify::{
-    event::{MetadataKind, ModifyKind},
     Config, EventKind, RecursiveMode, Watcher as NotifyWatcher,
+    event::{MetadataKind, ModifyKind},
 };
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -50,6 +50,8 @@ pub(crate) struct AppServer {
     pub(crate) watcher: Box<dyn notify::Watcher>,
     pub(crate) _watcher_tx: UnboundedSender<notify::Event>,
     pub(crate) watcher_rx: UnboundedReceiver<notify::Event>,
+    pub(crate) recursive_watch_roots: HashSet<PathBuf>,
+    pub(crate) nonrecursive_watch_roots: HashSet<PathBuf>,
 
     // Tracked state related to open builds and hot reloading
     pub(crate) applied_client_hot_reload_message: HotReloadMsg,
@@ -204,6 +206,8 @@ impl AppServer {
             watcher,
             watcher_rx,
             _watcher_tx: watcher_tx,
+            recursive_watch_roots: Default::default(),
+            nonrecursive_watch_roots: Default::default(),
             interactive,
             _force_sequential: force_sequential,
             cross_origin_policy,
@@ -605,6 +609,12 @@ impl AppServer {
                 }
             }
             _ => {}
+        }
+
+        // Watch paths from depinfo so we can trigger rebuilds when dependencies change
+        // This handles directories added via cargo:rerun-if-changed in build.rs
+        if self.watch_fs {
+            self.watch_depinfo_paths(artifacts);
         }
 
         let should_open = self.client.stage == BuildStage::Success
@@ -1020,51 +1030,93 @@ impl AppServer {
             self.client.build.crate_dir(),
             self.client.build.crate_package,
         ) {
-            tracing::trace!("Watching path {path:?}");
-
-            if let Err(err) = self.watcher.watch(&path, RecursiveMode::Recursive) {
-                handle_notify_error(err);
-            }
+            self.watch_path(path, RecursiveMode::Recursive);
         }
 
         // Watch additional paths from [web.watcher].watch_path config
         let crate_dir = self.client.build.crate_dir();
-        for watch_path in &self.client.build.config.web.watcher.watch_path {
+        let configured_watch_paths = self.client.build.config.web.watcher.watch_path.clone();
+        for watch_path in configured_watch_paths {
             let path = crate_dir.join(watch_path);
             if path.exists() {
-                tracing::trace!("Watching configured path {path:?}");
-                if let Err(err) = self.watcher.watch(&path, RecursiveMode::Recursive) {
-                    handle_notify_error(err);
-                }
+                self.watch_path(path, RecursiveMode::Recursive);
             }
         }
 
         if let Some(server) = self.server.as_ref() {
             // Watch the server's crate directory as well
-            for path in self.watch_paths(server.build.crate_dir(), server.build.crate_package) {
-                tracing::trace!("Watching path {path:?}");
-
-                if let Err(err) = self.watcher.watch(&path, RecursiveMode::Recursive) {
-                    handle_notify_error(err);
-                }
+            let paths = self.watch_paths(server.build.crate_dir(), server.build.crate_package);
+            for path in paths {
+                self.watch_path(path, RecursiveMode::Recursive);
             }
         }
 
         // Also watch the crates themselves, but not recursively, such that we can pick up new folders
         for krate in self.all_watched_crates() {
-            tracing::trace!("Watching path {krate:?}");
-            if let Err(err) = self.watcher.watch(&krate, RecursiveMode::NonRecursive) {
-                handle_notify_error(err);
-            }
+            self.watch_path(krate, RecursiveMode::NonRecursive);
         }
 
         // Also watch the workspace dir, non recursively, such that we can pick up new folders there too
-        if let Err(err) = self.watcher.watch(
-            self.workspace.krates.workspace_root().as_std_path(),
-            RecursiveMode::NonRecursive,
-        ) {
+        let workspace_root = self
+            .workspace
+            .krates
+            .workspace_root()
+            .as_std_path()
+            .to_path_buf();
+        self.watch_path(workspace_root, RecursiveMode::NonRecursive);
+    }
+
+    /// Watch paths from depinfo after a build completes.
+    /// This catches build inputs outside the normal workspace watch frontier,
+    /// including directories added via cargo:rerun-if-changed in build.rs.
+    fn watch_depinfo_paths(&mut self, artifacts: &BuildArtifacts) {
+        for path in &artifacts.depinfo.files {
+            let Ok(path) = canonical_existing_path(path) else {
+                continue;
+            };
+
+            if self.path_covered_by_recursive_watch(&path) {
+                continue;
+            }
+
+            let mode = if path.is_dir() {
+                RecursiveMode::Recursive
+            } else {
+                RecursiveMode::NonRecursive
+            };
+
+            self.watch_path(path, mode);
+        }
+    }
+
+    fn watch_path(&mut self, path: impl AsRef<Path>, mode: RecursiveMode) {
+        let Ok(path) = canonical_existing_path(path.as_ref()) else {
+            return;
+        };
+
+        let roots = match mode {
+            RecursiveMode::Recursive => &mut self.recursive_watch_roots,
+            RecursiveMode::NonRecursive => &mut self.nonrecursive_watch_roots,
+        };
+
+        if !roots.insert(path.clone()) {
+            return;
+        }
+
+        tracing::trace!("Watching path {path:?}");
+        if let Err(err) = self.watcher.watch(&path, mode) {
             handle_notify_error(err);
         }
+    }
+
+    fn path_covered_by_recursive_watch(&self, path: &Path) -> bool {
+        self.recursive_watch_roots.iter().any(|root| {
+            if root.is_file() {
+                path == root
+            } else {
+                path.starts_with(root)
+            }
+        })
     }
 
     /// Return the list of paths that we should watch for changes.
@@ -1448,6 +1500,17 @@ fn handle_notify_error(err: notify::Error) {
         }
         _ => {}
     }
+}
+
+fn canonical_existing_path(path: &Path) -> std::io::Result<PathBuf> {
+    if !path.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "watch path does not exist",
+        ));
+    }
+
+    dunce::canonicalize(path)
 }
 
 /// Detects if `dx` is being ran in a WSL environment.
