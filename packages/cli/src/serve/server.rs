@@ -1,6 +1,6 @@
 use crate::{
-    BuildId, BuildStage, BuilderUpdate, BundleFormat, Result, TraceSrc, config::WebHttpsConfig,
-    serve::ServeUpdate,
+    BuildId, BuildStage, BuilderUpdate, BundleFormat, Error, Result, TraceSrc,
+    config::WebHttpsConfig, serve::ServeUpdate,
 };
 use anyhow::{Context, bail};
 use axum::{
@@ -12,7 +12,7 @@ use axum::{
     },
     http::{
         Method, Response, StatusCode,
-        header::{CACHE_CONTROL, EXPIRES, HeaderName, HeaderValue, PRAGMA},
+        header::{CACHE_CONTROL, CONTENT_TYPE, EXPIRES, HeaderName, HeaderValue, PRAGMA},
     },
     middleware::{self, Next},
     response::IntoResponse,
@@ -24,6 +24,7 @@ use futures_util::{
     StreamExt, future,
     stream::{self, FuturesUnordered},
 };
+use html_escape::encode_text;
 use hyper::HeaderMap;
 use rustls::crypto::{CryptoProvider, ring::default_provider};
 use serde::{Deserialize, Serialize};
@@ -69,6 +70,103 @@ pub(crate) struct ConnectedWsClient {
     build_id: Option<BuildId>,
     aslr_reference: Option<u64>,
     pid: Option<u32>,
+}
+
+fn render_backend_wait_page(error: &Error) -> String {
+    let escaped_error = encode_text(&format!("{error:#?}")).to_string();
+
+    format!(
+        r#"<!doctype html>
+<html lang=\"en\">
+<head>
+  <meta charset=\"utf-8\" />
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
+  <title>Backend starting...</title>
+  <style>
+    :root {{
+      color-scheme: dark;
+    }}
+
+    body {{
+      margin: 0;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: radial-gradient(circle at 20% 20%, #111827, #0b1220 55%);
+      color: #e5e7eb;
+      font-family: system-ui, -apple-system, Segoe UI, sans-serif;
+      padding: 16px;
+    }}
+
+    main {{
+      width: min(640px, calc(100% - 24px));
+      padding: 28px 26px;
+      text-align: left;
+      background: #0f172a;
+      border: 1px solid #1f2937;
+      border-radius: 14px;
+      box-shadow: 0 16px 46px rgba(0,0,0,0.32);
+    }}
+
+    h1 {{
+      margin: 0 0 8px;
+      font-size: 21px;
+      letter-spacing: 0.2px;
+    }}
+
+    p {{
+      margin: 0 0 14px;
+      font-size: 14px;
+      line-height: 1.6;
+      color: #cbd5e1;
+    }}
+
+    pre {{
+      margin: 0;
+      padding: 12px 14px;
+      background: #0b1220;
+      border: 1px solid #1f2937;
+      border-radius: 10px;
+      color: #e5e7eb;
+      font-size: 13px;
+      line-height: 1.45;
+      white-space: pre-wrap;
+      word-break: break-word;
+      max-height: 320px;
+      overflow: auto;
+    }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Backend starting...</h1>
+    <p>Waiting for the backend to accept connections. This page will reload automatically once it responds.</p>
+    <pre>{escaped_error}</pre>
+  </main>
+  <script>
+    const target = location.href;
+    let delay = 600;
+
+    async function poll() {{
+      try {{
+        const res = await fetch(target, {{ method: 'GET', cache: 'no-store' }});
+        if (res.ok || (res.status >= 300 && res.status < 400)) {{
+          location.reload();
+          return;
+        }}
+      }} catch (e) {{}}
+
+      delay = Math.min(Math.floor(delay * 1.6), 5000);
+      setTimeout(poll, delay);
+    }}
+
+    poll();
+  </script>
+</body>
+</html>
+"#
+    )
 }
 
 impl WebServer {
@@ -483,11 +581,12 @@ fn build_devserver_router(
             format!("http://{address}").parse().unwrap(),
             true,
             |error| {
+                tracing::error!(dx_src = ?TraceSrc::Dev, "Fullstack proxy error: {error:#?}");
+                let body = render_backend_wait_page(&error);
                 Response::builder()
                     .status(StatusCode::INTERNAL_SERVER_ERROR)
-                    .body(Body::from(format!(
-                        "Backend connection failed. The backend is likely still starting up. Please try again in a few seconds. Error: {error:#?}"
-                    )))
+                    .header(CONTENT_TYPE, "text/html; charset=utf-8")
+                    .body(Body::from(body))
                     .unwrap()
             },
         ));
