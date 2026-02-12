@@ -5893,6 +5893,11 @@ __wbg_init({{module_or_path: "/{}/{wasm_path}"}}).then((wasm) => {{
         // Skip args[0] which is the rustc binary path captured by the wrapper
         cmd.args(rustc_args.args[1..].iter());
 
+        // Match tip-crate thin builds for wasm/wasi so cached dep objects are link-compatible.
+        if self.is_wasm_or_wasi() {
+            cmd.arg("-Crelocation-model=pic");
+        }
+
         // Restore the captured environment, filtering out wrapper env vars and
         // stale cargo jobserver vars to prevent recursive invocation and warnings.
         let filtered_env_keys = [
