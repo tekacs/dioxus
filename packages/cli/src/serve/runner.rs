@@ -18,7 +18,7 @@ use futures_util::future::OptionFuture;
 use futures_util::StreamExt;
 use krates::NodeId;
 use notify::{
-    event::{MetadataKind, ModifyKind},
+    event::{AccessKind, AccessMode, ModifyKind},
     Config, EventKind, RecursiveMode, Watcher as NotifyWatcher,
 };
 use std::{
@@ -306,6 +306,7 @@ impl AppServer {
 
                 // Filter the changes
                 let mut files: Vec<PathBuf> = vec![];
+                let mut deferred_zero_len_files: Vec<PathBuf> = vec![];
 
                 // Decompose the events into a list of all the files that have changed
                 for event in changes.drain(..) {
@@ -319,18 +320,27 @@ impl AppServer {
                     }
 
                     for path in event.paths {
-                        // Workaround for notify and vscode-like editor:
-                        // - when edit & save a file in vscode, there will be two notifications,
-                        // - the first one is a file with empty content.
-                        // - filter the empty file notification to avoid false rebuild during hot-reload
-                        if let Ok(metadata) = std::fs::metadata(&path) {
-                            if metadata.len() == 0 {
+                        // Some editors and tools can emit an event while a file is transiently empty
+                        // (truncate + write). Defer these paths and check them again shortly.
+                        match std::fs::metadata(&path) {
+                            Ok(metadata) if metadata.is_file() && metadata.len() == 0 => {
+                                deferred_zero_len_files.push(path);
                                 continue;
                             }
+                            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                                deferred_zero_len_files.push(path);
+                                continue;
+                            }
+                            _ => {}
                         }
 
                         files.push(path);
                     }
+                }
+
+                if !deferred_zero_len_files.is_empty() {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    files.extend(deferred_zero_len_files);
                 }
 
                 ServeUpdate::FilesChanged { files }
@@ -1329,7 +1339,9 @@ impl AppServer {
 
     pub(crate) async fn open_debugger(&mut self, dev: &WebServer, build: BuildId) {
         if self.use_hotpatch_engine {
-            tracing::warn!("Debugging symbols might not work properly with hotpatching enabled. Consider disabling hotpatching for debugging.");
+            tracing::warn!(
+                "Debugging symbols might not work properly with hotpatching enabled. Consider disabling hotpatching for debugging."
+            );
         }
 
         match build {
@@ -1378,16 +1390,24 @@ fn create_notify_watcher(
         };
 
         let is_allowed_notify_event = match event.kind {
-            EventKind::Modify(ModifyKind::Data(_)) => true,
-            EventKind::Modify(ModifyKind::Name(_)) => true,
-            // The primary modification event on WSL's poll watcher.
-            EventKind::Modify(ModifyKind::Metadata(MetadataKind::WriteTime)) => true,
-            // Catch-all for unknown event types (windows)
-            EventKind::Modify(ModifyKind::Any) => true,
-            EventKind::Modify(ModifyKind::Metadata(_)) => false,
-            // Don't care about anything else.
-            EventKind::Create(_) => true,
-            EventKind::Remove(_) => true,
+            // Some backends report imprecise "Any" events for real writes.
+            EventKind::Any => true,
+            EventKind::Modify(
+                // Includes metadata/name/data changes; different editors and tools map writes
+                // to different modify sub-kinds depending on backend.
+                ModifyKind::Data(_)
+                | ModifyKind::Name(_)
+                | ModifyKind::Metadata(_)
+                | ModifyKind::Any
+                | ModifyKind::Other,
+            ) => true,
+            // Many "write then close" workflows only surface as access-close(write).
+            EventKind::Access(AccessKind::Close(
+                AccessMode::Write | AccessMode::Any | AccessMode::Other,
+            ))
+            | EventKind::Access(AccessKind::Any) => true,
+            // Create/remove still indicate actionable file churn.
+            EventKind::Create(_) | EventKind::Remove(_) => true,
             _ => false,
         };
 
