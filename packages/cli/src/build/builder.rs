@@ -732,13 +732,11 @@ impl AppBuilder {
         }
     }
 
-    pub(crate) async fn hotpatch(
-        &mut self,
-        res: &BuildArtifacts,
-        cache: &HotpatchModuleCache,
-    ) -> Result<JumpTable> {
-        let original = self.build.main_exe();
-        let new = self.build.patch_exe(res.time_start);
+    pub(crate) fn hotpatch_binary_path(&self, res: &BuildArtifacts) -> PathBuf {
+        self.build.patch_exe(res.time_start)
+    }
+
+    pub(crate) async fn prepare_hotpatch(&mut self, res: &BuildArtifacts) -> Result<()> {
         let asset_dir = self.build.asset_dir();
 
         // Hotpatch asset!() calls
@@ -773,7 +771,7 @@ impl AppBuilder {
         }
 
         // Make sure to add `include!()` calls to the watcher so we can watch changes as they evolve
-        for file in res.depinfo.files.iter() {
+        for file in &res.depinfo.files {
             let original_artifacts = self
                 .artifacts
                 .as_mut()
@@ -784,9 +782,15 @@ impl AppBuilder {
             }
         }
 
-        tracing::debug!("Patching {} -> {}", original.display(), new.display());
+        Ok(())
+    }
 
-        let mut jump_table = self.build.create_jump_table(&new, cache)?;
+    pub(crate) async fn finish_hotpatch(
+        &mut self,
+        res: &BuildArtifacts,
+        mut jump_table: JumpTable,
+    ) -> Result<JumpTable> {
+        let new = self.hotpatch_binary_path(res);
 
         // If it's android, we need to copy the assets to the device and then change the location of the patch
         if self.build.bundle == BundleFormat::Android {

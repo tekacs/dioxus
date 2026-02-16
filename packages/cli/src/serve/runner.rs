@@ -1,8 +1,8 @@
 use super::{AppBuilder, ServeUpdate, WebServer};
 use crate::{
     platform_override::CommandWithPlatformOverrides, BuildArtifacts, BuildId, BuildMode,
-    BuildTargets, BuilderUpdate, BundleFormat, HotpatchModuleCache, Result, ServeArgs, TailwindCli,
-    TraceSrc, Workspace,
+    BuildRequest, BuildTargets, BuilderUpdate, BundleFormat, HotpatchModuleCache, Result,
+    ServeArgs, TailwindCli, TraceSrc, Workspace,
 };
 use anyhow::{bail, Context};
 use dioxus_core::internal::{
@@ -28,6 +28,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+use subsecond_types::JumpTable;
 use syn::spanned::Spanned;
 use tokio::process::Command;
 
@@ -90,6 +91,32 @@ pub(crate) struct CachedFile {
     contents: String,
     most_recent: Option<String>,
     templates: HashMap<TemplateGlobalKey, HotReloadedTemplate>,
+}
+
+#[derive(Clone)]
+pub(crate) struct HotpatchComputePlan {
+    pub(crate) id: BuildId,
+    pub(crate) bundle: BuildArtifacts,
+    pub(crate) build: BuildRequest,
+    pub(crate) cache: Arc<HotpatchModuleCache>,
+}
+
+pub(crate) struct HotpatchComputed {
+    pub(crate) id: BuildId,
+    pub(crate) bundle: BuildArtifacts,
+    pub(crate) jump_table: JumpTable,
+}
+
+impl HotpatchComputePlan {
+    pub(crate) fn compute(self) -> Result<HotpatchComputed> {
+        let patch = self.build.patch_exe(self.bundle.time_start);
+        let jump_table = self.build.create_jump_table(&patch, &self.cache)?;
+        Ok(HotpatchComputed {
+            id: self.id,
+            bundle: self.bundle,
+            jump_table,
+        })
+    }
 }
 
 impl AppServer {
@@ -733,30 +760,74 @@ impl AppServer {
         self.clear_patches();
     }
 
-    pub(crate) async fn hotpatch(
+    pub(crate) fn prepare_hotpatch_compute(
+        &self,
+        bundle: BuildArtifacts,
+        id: BuildId,
+        cache: Arc<HotpatchModuleCache>,
+    ) -> Result<HotpatchComputePlan> {
+        let build = match id {
+            BuildId::PRIMARY => self.client.build.clone(),
+            BuildId::SECONDARY => self
+                .server
+                .as_ref()
+                .context("Server not found")?
+                .build
+                .clone(),
+            _ => bail!("Invalid build id"),
+        };
+        Ok(HotpatchComputePlan {
+            id,
+            bundle,
+            build,
+            cache,
+        })
+    }
+
+    pub(crate) async fn prepare_hotpatch_state(
         &mut self,
         bundle: &BuildArtifacts,
         id: BuildId,
-        cache: &HotpatchModuleCache,
-        devserver: &mut WebServer,
     ) -> Result<()> {
-        let elapsed = bundle
-            .time_end
-            .duration_since(bundle.time_start)
-            .unwrap_or_default();
-
-        let jump_table = match id {
-            BuildId::PRIMARY => self.client.hotpatch(bundle, cache).await,
+        match id {
+            BuildId::PRIMARY => self.client.prepare_hotpatch(bundle).await,
             BuildId::SECONDARY => {
                 self.server
                     .as_mut()
                     .context("Server not found")?
-                    .hotpatch(bundle, cache)
+                    .prepare_hotpatch(bundle)
                     .await
             }
             _ => bail!("Invalid build id"),
-        }?;
+        }
+    }
 
+    pub(crate) async fn finish_computed_hotpatch(
+        &mut self,
+        id: BuildId,
+        bundle: &BuildArtifacts,
+        jump_table: JumpTable,
+    ) -> Result<JumpTable> {
+        match id {
+            BuildId::PRIMARY => self.client.finish_hotpatch(bundle, jump_table).await,
+            BuildId::SECONDARY => {
+                self.server
+                    .as_mut()
+                    .context("Server not found")?
+                    .finish_hotpatch(bundle, jump_table)
+                    .await
+            }
+            _ => bail!("Invalid build id"),
+        }
+    }
+
+    pub(crate) async fn send_hotpatch_patch(
+        &mut self,
+        id: BuildId,
+        elapsed: Duration,
+        jump_table: JumpTable,
+        devserver: &mut WebServer,
+    ) -> Result<()> {
         if id == BuildId::PRIMARY {
             self.applied_client_hot_reload_message.jump_table = self.client.patches.last().cloned();
         }
