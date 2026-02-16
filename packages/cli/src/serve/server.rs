@@ -75,6 +75,7 @@ pub(crate) struct ConnectedWsClient {
 
 impl WebServer {
     pub const SELF_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+    const WS_SEND_TIMEOUT: Duration = Duration::from_millis(500);
 
     /// Start the development server.
     /// This will set up the default http server if there's no server specified (usually via fullstack).
@@ -165,8 +166,15 @@ impl WebServer {
 
                     // Update the socket with project info and current build status
                     let project_info = SharedStatus::new(Status::ClientInit { application_name: self.application_name.clone(), bundle: self.bundle });
-                    if project_info.send_to(&mut new_socket.socket).await.is_ok() {
-                        _ = self.build_status.send_to(&mut new_socket.socket).await;
+                    if tokio::time::timeout(Self::WS_SEND_TIMEOUT, project_info.send_to(&mut new_socket.socket))
+                        .await
+                        .is_ok_and(|result| result.is_ok())
+                    {
+                        _ = tokio::time::timeout(
+                            Self::WS_SEND_TIMEOUT,
+                            self.build_status.send_to(&mut new_socket.socket),
+                        )
+                        .await;
                         self.build_status_sockets.push(new_socket);
                     }
                     return future::pending::<ServeUpdate>().await;
@@ -200,7 +208,14 @@ impl WebServer {
         let mut i = 0;
         while i < self.build_status_sockets.len() {
             let socket = &mut self.build_status_sockets[i];
-            if self.build_status.send_to(&mut socket.socket).await.is_err() {
+            let send_result = tokio::time::timeout(
+                Self::WS_SEND_TIMEOUT,
+                self.build_status.send_to(&mut socket.socket),
+            )
+            .await;
+
+            if !send_result.is_ok_and(|result| result.is_ok()) {
+                tracing::debug!("Dropping stale build-status socket after send timeout/error");
                 self.build_status_sockets.remove(i);
             } else {
                 i += 1;
@@ -287,12 +302,14 @@ impl WebServer {
         let mut i = 0;
         while i < self.hot_reload_sockets.len() {
             let socket = &mut self.hot_reload_sockets[i];
-            if socket
-                .socket
-                .send(Message::Text(msg.clone().into()))
-                .await
-                .is_err()
-            {
+            let send_result = tokio::time::timeout(
+                Self::WS_SEND_TIMEOUT,
+                socket.socket.send(Message::Text(msg.clone().into())),
+            )
+            .await;
+
+            if !send_result.is_ok_and(|result| result.is_ok()) {
+                tracing::debug!("Dropping stale hotreload socket after send timeout/error");
                 self.hot_reload_sockets.remove(i);
             } else {
                 i += 1;
@@ -352,11 +369,19 @@ impl WebServer {
 
     /// Sends a devserver message to all connected clients.
     async fn send_devserver_message_to_all(&mut self, msg: DevserverMsg) {
-        for socket in self.hot_reload_sockets.iter_mut() {
-            _ = socket
-                .socket
-                .send(Message::Text(serde_json::to_string(&msg).unwrap().into()))
-                .await;
+        let msg = Message::Text(serde_json::to_string(&msg).unwrap().into());
+        let mut i = 0;
+        while i < self.hot_reload_sockets.len() {
+            let socket = &mut self.hot_reload_sockets[i];
+            let send_result =
+                tokio::time::timeout(Self::WS_SEND_TIMEOUT, socket.socket.send(msg.clone())).await;
+
+            if !send_result.is_ok_and(|result| result.is_ok()) {
+                tracing::debug!("Dropping stale devserver socket after send timeout/error");
+                self.hot_reload_sockets.remove(i);
+            } else {
+                i += 1;
+            }
         }
     }
 
