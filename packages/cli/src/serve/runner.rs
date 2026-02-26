@@ -101,6 +101,7 @@ impl AppServer {
         let interactive = args.is_interactive_tty();
         let force_sequential = args.platform_args.shared.targets.force_sequential_build();
         let cross_origin_policy = args.cross_origin_policy;
+        let stdin_watch = args.stdin_watch;
 
         // Find the launch args for the client and server
         let split_args = |args: &str| {
@@ -143,9 +144,14 @@ impl AppServer {
             .port
             .unwrap_or_else(|| get_available_port(devserver_bind_ip, Some(8080)).unwrap_or(8080));
 
-        // Spin up the file watcher
+        // Spin up the file watcher (or stdin-based watcher if --stdin-watch)
         let (watcher_tx, watcher_rx) = futures_channel::mpsc::unbounded();
-        let watcher = create_notify_watcher(watcher_tx.clone(), wsl_file_poll_interval as u64);
+        let watcher: Box<dyn NotifyWatcher> = if stdin_watch {
+            spawn_stdin_watch_reader(watcher_tx.clone());
+            create_noop_watcher()
+        } else {
+            create_notify_watcher(watcher_tx.clone(), wsl_file_poll_interval as u64)
+        };
 
         let ssg = args.platform_args.shared.targets.ssg;
         let target_args = CommandWithPlatformOverrides {
@@ -167,7 +173,7 @@ impl AppServer {
             .then(|| get_available_port(devserver_bind_ip, None))
             .flatten();
 
-        let watch_fs = args.watch.unwrap_or(true);
+        let watch_fs = args.watch.unwrap_or(true) || stdin_watch;
         let use_hotpatch_engine = args.hot_patch;
 
         let client = AppBuilder::new(&client)?;
@@ -217,9 +223,12 @@ impl AppServer {
 
         // Only register the hot-reload stuff if we're watching the filesystem
         if runner.watch_fs {
-            // Spin up the notify watcher
-            // When builds load though, we're going to parse their depinfo and add the paths to the watcher
-            runner.watch_filesystem();
+            // When using stdin_watch, skip the built-in filesystem watcher setup — the external
+            // process will send us file change events. We still load the RSX filemap so hot reload
+            // diffing works.
+            if !stdin_watch {
+                runner.watch_filesystem();
+            }
 
             // todo(jon): this might take a while so we should try and background it, or make it lazy somehow
             // we could spawn a thread to search the FS and then when it returns we can fill the filemap
@@ -341,6 +350,18 @@ impl AppServer {
                 if !deferred_zero_len_files.is_empty() {
                     tokio::time::sleep(Duration::from_millis(25)).await;
                     files.extend(deferred_zero_len_files);
+                }
+
+                // Check for the stdin-watch "force rebuild" sentinel.
+                // If present alongside real file changes, queue them as pending
+                // (handle_file_change will see them after the rebuild completes).
+                static REBUILD_SENTINEL: &str = "__rurere_force_rebuild__";
+                if files.iter().any(|p| p.as_os_str() == REBUILD_SENTINEL) {
+                    files.retain(|p| p.as_os_str() != REBUILD_SENTINEL);
+                    if !files.is_empty() {
+                        self.pending_file_changes.extend(files);
+                    }
+                    return ServeUpdate::RequestRebuild;
                 }
 
                 ServeUpdate::FilesChanged { files }
@@ -1431,6 +1452,104 @@ fn create_notify_watcher(
 
     // Otherwise we can use the recommended watcher
     Box::new(notify::recommended_watcher(handler).expect(NOTIFY_ERROR_MSG))
+}
+
+/// Create a no-op watcher that doesn't actually watch anything.
+/// Used when --stdin-watch is active and an external process drives file change events.
+fn create_noop_watcher() -> Box<dyn NotifyWatcher> {
+    // A PollWatcher with a very long interval that never watches any paths acts as a no-op.
+    // We need a real Watcher instance because AppServer stores it as Box<dyn Watcher>.
+    Box::new(
+        notify::PollWatcher::new(
+            |_: notify::Result<notify::Event>| {},
+            Config::default().with_poll_interval(Duration::from_secs(86400)),
+        )
+        .expect("Failed to create no-op watcher"),
+    )
+}
+
+/// JSON protocol for --stdin-watch. One JSON object per line.
+#[derive(serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum StdinWatchEvent {
+    /// File(s) changed — fed into the hot reload pipeline.
+    Change { paths: Vec<PathBuf> },
+    /// Force a full rebuild (equivalent to pressing 'r').
+    Rebuild,
+}
+
+/// Spawn a tokio task that reads JSON lines from stdin and injects them into the watcher channel.
+///
+/// - `{"kind":"change","paths":["src/foo.rs"]}` → `notify::Event(Modify)` for each path
+/// - `{"kind":"rebuild"}` → sentinel event that `wait()` converts to `RequestRebuild`
+fn spawn_stdin_watch_reader(tx: UnboundedSender<notify::Event>) {
+    // Resolve cwd once at startup so relative paths from the external driver
+    // are canonicalized to the absolute paths the serve pipeline expects.
+    let cwd = std::env::current_dir().unwrap_or_default();
+
+    tokio::spawn(async move {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let stdin = tokio::io::stdin();
+        let mut reader = BufReader::new(stdin);
+        let mut line = String::new();
+
+        loop {
+            line.clear();
+            match reader.read_line(&mut line).await {
+                Ok(0) => break, // EOF — stdin closed
+                Ok(_) => {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    match serde_json::from_str::<StdinWatchEvent>(trimmed) {
+                        Ok(StdinWatchEvent::Change { paths }) => {
+                            // Canonicalize paths: the serve pipeline compares against absolute
+                            // workspace paths (file_map keys, depinfo, etc.), so relative inputs
+                            // must be resolved against cwd.
+                            let paths = paths
+                                .into_iter()
+                                .map(|p| if p.is_absolute() { p } else { cwd.join(&p) })
+                                .collect();
+                            let event = notify::Event {
+                                kind: EventKind::Modify(ModifyKind::Data(
+                                    notify::event::DataChange::Content,
+                                )),
+                                paths,
+                                attrs: Default::default(),
+                            };
+                            if tx.unbounded_send(event).is_err() {
+                                break;
+                            }
+                        }
+                        Ok(StdinWatchEvent::Rebuild) => {
+                            // Send a synthetic event with a sentinel path that wait() can detect.
+                            // We use a path that can't exist as a real file.
+                            let event = notify::Event {
+                                kind: EventKind::Modify(ModifyKind::Data(
+                                    notify::event::DataChange::Content,
+                                )),
+                                paths: vec![PathBuf::from("__rurere_force_rebuild__")],
+                                attrs: Default::default(),
+                            };
+                            if tx.unbounded_send(event).is_err() {
+                                break;
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!("stdin-watch: invalid JSON: {err}: {trimmed}");
+                        }
+                    }
+                }
+                Err(err) => {
+                    tracing::error!("stdin-watch: read error: {err}");
+                    break;
+                }
+            }
+        }
+
+        tracing::info!("stdin-watch: stdin closed, watcher stopped");
+    });
 }
 
 fn handle_notify_error(err: notify::Error) {
