@@ -5062,6 +5062,7 @@ impl BuildRequest {
             .demangle(demangle)
             .keep_debug(keep_debug)
             .keep_lld_sections(true)
+            .emit_hotpatch_metadata(ctx.mode == BuildMode::Fat)
             .out_name(self.executable_name())
             .out_dir(&bindgen_outdir)
             .remove_name_section(!keep_names)

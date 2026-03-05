@@ -2,12 +2,14 @@ use crate::{CliSettings, Result, Workspace};
 use anyhow::{anyhow, Context};
 use flate2::read::GzDecoder;
 use std::path::{Path, PathBuf};
+use std::sync::Once;
 use tar::Archive;
 use tempfile::TempDir;
 use tokio::process::Command;
 
 const DX_WASM_BINDGEN_PATH: &str = "DX_WASM_BINDGEN_PATH";
 const DX_WASM_BINDGEN_SYSTEM: &str = "DX_WASM_BINDGEN_SYSTEM";
+static LOG_WASM_BINDGEN_BINARY_ONCE: Once = Once::new();
 
 pub(crate) struct WasmBindgen {
     version: String,
@@ -21,6 +23,7 @@ pub(crate) struct WasmBindgen {
     remove_name_section: bool,
     remove_producers_section: bool,
     keep_lld_exports: bool,
+    emit_hotpatch_metadata: bool,
 }
 
 impl WasmBindgen {
@@ -37,6 +40,7 @@ impl WasmBindgen {
             remove_name_section: false,
             remove_producers_section: false,
             keep_lld_exports: false,
+            emit_hotpatch_metadata: false,
         }
     }
 
@@ -101,47 +105,59 @@ impl WasmBindgen {
         }
     }
 
+    pub(crate) fn emit_hotpatch_metadata(self, emit_hotpatch_metadata: bool) -> Self {
+        Self {
+            emit_hotpatch_metadata,
+            ..self
+        }
+    }
+
     /// Run the bindgen command with the current settings
     pub(crate) async fn run(&self) -> Result<std::process::Output> {
         let binary = self.get_binary_path()?;
+        self.log_binary_selection_once(&binary);
 
-        let mut args = Vec::new();
+        let mut args = Vec::<String>::new();
 
         // Target
-        args.push("--target");
-        args.push(&self.target);
+        args.push("--target".to_string());
+        args.push(self.target.clone());
 
         // Options
         if self.debug {
-            args.push("--debug");
+            args.push("--debug".to_string());
         }
 
         if !self.demangle {
-            args.push("--no-demangle");
+            args.push("--no-demangle".to_string());
         }
 
         if self.keep_debug {
-            args.push("--keep-debug");
+            args.push("--keep-debug".to_string());
         }
 
         if self.remove_name_section {
-            args.push("--remove-name-section");
+            args.push("--remove-name-section".to_string());
         }
 
         if self.remove_producers_section {
-            args.push("--remove-producers-section");
+            args.push("--remove-producers-section".to_string());
         }
 
         if self.keep_lld_exports {
-            args.push("--keep-lld-exports");
+            args.push("--keep-lld-exports".to_string());
+        }
+
+        if self.emit_hotpatch_metadata {
+            args.push("--emit-hotpatch-metadata".to_string());
         }
 
         // Out name
-        args.push("--out-name");
-        args.push(&self.out_name);
+        args.push("--out-name".to_string());
+        args.push(self.out_name.clone());
 
         // wbg generates typescript bindnings by default - we don't want those
-        args.push("--no-typescript");
+        args.push("--no-typescript".to_string());
 
         // Out dir
         let out_dir = self
@@ -149,20 +165,36 @@ impl WasmBindgen {
             .to_str()
             .expect("input_path should be valid utf8");
 
-        args.push("--out-dir");
-        args.push(out_dir);
+        args.push("--out-dir".to_string());
+        args.push(out_dir.to_string());
 
         // Input path
         let input_path = self
             .input_path
             .to_str()
             .expect("input_path should be valid utf8");
-        args.push(input_path);
+        args.push(input_path.to_string());
 
         tracing::debug!("wasm-bindgen: {:#?}", args);
 
         // Run bindgen
-        let output = Command::new(binary).args(args).output().await?;
+        let mut output = Command::new(&binary).args(&args).output().await?;
+        let mut metadata_flag_supported = self.emit_hotpatch_metadata;
+        if self.emit_hotpatch_metadata
+            && !output.status.success()
+            && String::from_utf8_lossy(&output.stderr).contains("--emit-hotpatch-metadata")
+        {
+            tracing::warn!(
+                "wasm-bindgen at {} does not support --emit-hotpatch-metadata, retrying without it",
+                binary.display()
+            );
+            metadata_flag_supported = false;
+            let fallback_args = args
+                .into_iter()
+                .filter(|arg| arg != "--emit-hotpatch-metadata")
+                .collect::<Vec<_>>();
+            output = Command::new(binary).args(fallback_args).output().await?;
+        }
 
         // Check for errors
         if !output.stderr.is_empty() {
@@ -177,6 +209,10 @@ impl WasmBindgen {
                     String::from_utf8_lossy(&output.stderr)
                 );
             }
+        }
+
+        if output.status.success() {
+            self.log_hotpatch_metadata_status(metadata_flag_supported);
         }
 
         Ok(output)
@@ -444,6 +480,49 @@ impl WasmBindgen {
         std::env::var(DX_WASM_BINDGEN_SYSTEM)
             .map(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
             .unwrap_or(false)
+    }
+
+    fn log_binary_selection_once(&self, binary: &Path) {
+        LOG_WASM_BINDGEN_BINARY_ONCE.call_once(|| {
+            let source = if self.override_binary_path().is_some() {
+                format!("override via {DX_WASM_BINDGEN_PATH}")
+            } else if self.use_system_bindgen() {
+                format!("system PATH via {DX_WASM_BINDGEN_SYSTEM}")
+            } else if CliSettings::prefer_no_downloads() {
+                "system PATH via no-downloads mode".to_string()
+            } else {
+                "managed dioxus tool cache".to_string()
+            };
+            tracing::info!("Using wasm-bindgen binary ({source}): {}", binary.display());
+        });
+    }
+
+    fn log_hotpatch_metadata_status(&self, metadata_flag_supported: bool) {
+        if !self.emit_hotpatch_metadata {
+            return;
+        }
+
+        if !metadata_flag_supported {
+            tracing::warn!(
+                "Hotpatch metadata emission disabled for this run: wasm-bindgen does not support --emit-hotpatch-metadata"
+            );
+            return;
+        }
+
+        let sidecar_path = self
+            .out_dir
+            .join(format!("{}_bg.hotpatch-metadata.json", self.out_name));
+        if sidecar_path.exists() {
+            tracing::info!(
+                "Hotpatch metadata emission succeeded: {}",
+                sidecar_path.display()
+            );
+        } else {
+            tracing::warn!(
+                "Hotpatch metadata emission was requested but sidecar is missing: {}",
+                sidecar_path.display()
+            );
+        }
     }
 
     fn install_dir(&self) -> anyhow::Result<PathBuf> {

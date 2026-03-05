@@ -19,6 +19,7 @@ mod patch;
 mod pre_render;
 mod request;
 mod tools;
+mod wasm_hotpatch_metadata;
 
 pub(crate) use assets::*;
 pub(crate) use builder::*;
