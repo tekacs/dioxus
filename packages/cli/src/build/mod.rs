@@ -22,9 +22,13 @@ mod patch;
 mod renderer;
 mod request;
 
+mod android;
+
 pub(crate) use android::AndroidTools;
 pub(crate) use assets::*;
 pub(crate) use builder::*;
 pub(crate) use context::*;
 pub(crate) use patch::*;
 pub(crate) use request::*;
+
+mod wasm_hotpatch_metadata;

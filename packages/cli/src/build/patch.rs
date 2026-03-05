@@ -26,6 +26,8 @@ use wasmparser::{
     BinaryReader, BinaryReaderError, Linking, LinkingSectionReader, Payload, SymbolInfo,
 };
 
+use super::wasm_hotpatch_metadata::WasmHotpatchMetadata;
+
 type Result<T, E = PatchError> = std::result::Result<T, E>;
 
 #[derive(Debug, Error)]
@@ -472,6 +474,7 @@ pub fn create_native_jump_table(
 pub fn create_wasm_jump_table(patch: &Path, cache: &HotpatchModuleCache) -> Result<JumpTable> {
     let name_to_ifunc_old = &cache.symbol_ifunc_map;
     let old = &cache.old_wasm;
+    let metadata = WasmHotpatchMetadata::load_for_base_wasm(&cache.path);
     let old_symbols =
         parse_bytes_to_data_segment(&cache.old_bytes).context("Failed to parse data segment")?;
     let new_bytes = std::fs::read(patch).context("Could not read patch file")?;
@@ -664,7 +667,7 @@ pub fn create_wasm_jump_table(patch: &Path, cache: &HotpatchModuleCache) -> Resu
             continue;
         }
 
-        if name_is_bindgen_symbol(&name) {
+        if metadata.is_bindgen_symbol(&name) || name_is_bindgen_symbol(&name) {
             new.imports.delete(env_func_import);
             convert_func_to_ifunc_call(&mut new, ifunc_table_initializer, func_id, 0, name);
             continue;
@@ -684,10 +687,16 @@ pub fn create_wasm_jump_table(patch: &Path, cache: &HotpatchModuleCache) -> Resu
         import.module = "env".into();
         import.name = format!("__saved_wbg_{}", import.name);
 
-        if name_is_bindgen_symbol(&import.name) {
+        let metadata_matches = metadata.is_bindgen_symbol(&import.name)
+            || metadata.has_placeholder_import(&import.name);
+
+        if metadata_matches || name_is_bindgen_symbol(&import.name) {
             let name = import.name.as_str().to_string();
+            let table_idx = metadata
+                .cast_target_ifunc_index(&name, name_to_ifunc_old)
+                .unwrap_or(0);
             new.imports.delete(import_id);
-            convert_func_to_ifunc_call(&mut new, ifunc_table_initializer, func_id, 0, name);
+            convert_func_to_ifunc_call(&mut new, ifunc_table_initializer, func_id, table_idx, name);
         }
     }
 
