@@ -6,6 +6,9 @@ use tar::Archive;
 use tempfile::TempDir;
 use tokio::process::Command;
 
+const DX_WASM_BINDGEN_PATH: &str = "DX_WASM_BINDGEN_PATH";
+const DX_WASM_BINDGEN_SYSTEM: &str = "DX_WASM_BINDGEN_SYSTEM";
+
 pub(crate) struct WasmBindgen {
     version: String,
     input_path: PathBuf,
@@ -185,6 +188,9 @@ impl WasmBindgen {
     /// For managed installations, this will check that the version managed by `dx` is the specified version.
     pub async fn verify_install(version: &str) -> anyhow::Result<()> {
         let settings = Self::new(version);
+        if settings.override_binary_path().is_some() || settings.use_system_bindgen() {
+            return settings.verify_override_install().await;
+        }
         if CliSettings::prefer_no_downloads() {
             settings.verify_local_install().await
         } else {
@@ -373,6 +379,33 @@ impl WasmBindgen {
         Ok(())
     }
 
+    async fn verify_override_install(&self) -> anyhow::Result<()> {
+        let binary = self.get_binary_path()?;
+        let output = Command::new(&binary)
+            .args(["--version"])
+            .output()
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to check wasm-bindgen-cli version for {}",
+                    binary.display()
+                )
+            })?;
+
+        let stdout = String::from_utf8(output.stdout)
+            .context("Failed to extract wasm-bindgen-cli output")?;
+        let installed_version = stdout.trim_start_matches("wasm-bindgen").trim();
+        if installed_version != self.version {
+            tracing::warn!(
+                "Using overridden wasm-bindgen-cli@{} (workspace uses {})",
+                installed_version,
+                self.version
+            );
+        }
+
+        Ok(())
+    }
+
     async fn verify_managed_install(&self) -> anyhow::Result<()> {
         tracing::trace!(
             "Verifying wasm-bindgen-cli@{} is installed in the tool directory",
@@ -390,7 +423,11 @@ impl WasmBindgen {
     }
 
     pub fn get_binary_path(&self) -> anyhow::Result<PathBuf> {
-        if CliSettings::prefer_no_downloads() {
+        if let Some(path) = self.override_binary_path() {
+            return Ok(path);
+        }
+
+        if self.use_system_bindgen() || CliSettings::prefer_no_downloads() {
             which::which("wasm-bindgen")
                 .map_err(|_| anyhow!("Missing wasm-bindgen-cli@{}", self.version))
         } else {
@@ -398,6 +435,16 @@ impl WasmBindgen {
             let install_dir = self.install_dir()?;
             Ok(install_dir.join(installed_name))
         }
+    }
+
+    fn override_binary_path(&self) -> Option<PathBuf> {
+        std::env::var_os(DX_WASM_BINDGEN_PATH).map(PathBuf::from)
+    }
+
+    fn use_system_bindgen(&self) -> bool {
+        std::env::var(DX_WASM_BINDGEN_SYSTEM)
+            .map(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
+            .unwrap_or(false)
     }
 
     fn install_dir(&self) -> anyhow::Result<PathBuf> {
