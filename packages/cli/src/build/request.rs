@@ -2253,6 +2253,10 @@ impl BuildRequest {
             keep_bundled_output_paths
         );
 
+        // Remove stale assets that won't be part of this build.
+        // This cleans up old hashed files from previous builds.
+        self.remove_stale_assets(&asset_dir, &keep_bundled_output_paths);
+
         // todo(jon): we also want to eventually include options for each asset's optimization and compression, which we currently aren't
         let mut assets_to_transfer = vec![];
 
@@ -5162,8 +5166,9 @@ impl BuildRequest {
         // This runs post-bindgen after wasm-bindgen has already cleaned up its own dead imports
         // and adapter machinery, while fat mode's `--keep-local-functions` keeps local Rust code alive.
         if ctx.mode == BuildMode::Fat {
+            let metadata = crate::build::wasm_hotpatch_metadata::WasmHotpatchMetadata::load_for_base_wasm(&post_bindgen_wasm);
             let bindgened = std::fs::read(&post_bindgen_wasm)?;
-            let finalized = crate::build::finalize_wasm_base_module(&bindgened)?;
+            let finalized = crate::build::finalize_wasm_base_module(&bindgened, &metadata)?;
             std::fs::write(&post_bindgen_wasm, finalized)?;
         }
 
@@ -7066,7 +7071,6 @@ We checked the folders:
 
         Ok(())
     }
-
     /// Log the build duration and some metadata about the build, saving a telemetry event.
     fn record_build_duration(&self, time_start: SystemTime, ctx: &BuildContext) {
         // Calculate some final metadata for logging
@@ -7091,6 +7095,142 @@ We checked the folders:
             }),
             "Build completed in {time_taken}ms",
         );
+    }
+
+    /// Remove stale assets from the output directories that won't be part of the current build.
+    ///
+    /// This walks both the asset directory (for hashed assets) and the root directory (for
+    /// public_dir assets which use `../` prefix in their bundled paths) and removes any files
+    /// that aren't in the set of paths to keep.
+    fn remove_stale_assets(&self, asset_dir: &Path, keep_paths: &HashSet<PathBuf>) {
+        // Normalize keep_paths for reliable comparison.
+        // We can't canonicalize because files may not exist yet (they're about to be written).
+        // Instead, normalize by cleaning up the path components.
+        let keep_normalized: HashSet<PathBuf> =
+            keep_paths.iter().map(|p| normalize_path(p)).collect();
+
+        let root_dir = self.root_dir();
+
+        // Protected directories that should never be deleted (relative to root_dir)
+        let protected_dirs: HashSet<&str> = ["assets", "wasm", "snippets"].into_iter().collect();
+
+        // Protected files that should never be deleted
+        let protected_files: HashSet<&str> = ["index.html", ".manifest.json"].into_iter().collect();
+
+        let mut removed_count = 0;
+
+        // Walk the asset directory to clean stale hashed assets
+        if asset_dir.exists() {
+            if let Ok(entries) = std::fs::read_dir(asset_dir) {
+                for entry in entries.filter_map(|e| e.ok()) {
+                    let path = entry.path();
+                    if !path.is_file() {
+                        continue;
+                    }
+
+                    // Check if this file should be kept by comparing normalized paths
+                    let normalized = normalize_path(&path);
+                    if !keep_normalized.contains(&normalized) {
+                        if let Err(e) = std::fs::remove_file(&path) {
+                            tracing::warn!("Failed to remove stale asset {:?}: {}", path, e);
+                        } else {
+                            tracing::debug!("Removed stale asset: {:?}", path);
+                            removed_count += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Walk the root directory for public_dir assets (non-recursive, top-level files only)
+        // Public assets use `../{relative}` bundled paths, placing them in root_dir
+        if root_dir.exists() {
+            if let Ok(entries) = std::fs::read_dir(&root_dir) {
+                for entry in entries.filter_map(|e| e.ok()) {
+                    let path = entry.path();
+
+                    // Skip protected directories
+                    if path.is_dir() {
+                        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                            if protected_dirs.contains(name) {
+                                continue;
+                            }
+                        }
+                        // For other directories, recurse to clean public_dir subdirectories
+                        self.remove_stale_public_assets(
+                            &path,
+                            &keep_normalized,
+                            &mut removed_count,
+                        );
+                        continue;
+                    }
+
+                    // Skip protected files
+                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                        if protected_files.contains(name) {
+                            continue;
+                        }
+                    }
+
+                    // Check if this file should be kept
+                    let normalized = normalize_path(&path);
+                    if !keep_normalized.contains(&normalized) {
+                        if let Err(e) = std::fs::remove_file(&path) {
+                            tracing::warn!("Failed to remove stale public asset {:?}: {}", path, e);
+                        } else {
+                            tracing::debug!("Removed stale public asset: {:?}", path);
+                            removed_count += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        if removed_count > 0 {
+            tracing::info!(
+                "Removed {} stale asset(s) from previous builds",
+                removed_count
+            );
+        }
+    }
+
+    /// Recursively remove stale public assets from subdirectories.
+    /// This handles nested public_dir structures.
+    fn remove_stale_public_assets(
+        &self,
+        dir: &Path,
+        keep_normalized: &HashSet<PathBuf>,
+        removed_count: &mut usize,
+    ) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+
+            if path.is_dir() {
+                self.remove_stale_public_assets(&path, keep_normalized, removed_count);
+                // Remove empty directories
+                if std::fs::read_dir(&path)
+                    .map(|mut d| d.next().is_none())
+                    .unwrap_or(false)
+                {
+                    let _ = std::fs::remove_dir(&path);
+                }
+                continue;
+            }
+
+            let normalized = normalize_path(&path);
+            if !keep_normalized.contains(&normalized) {
+                if let Err(e) = std::fs::remove_file(&path) {
+                    tracing::warn!("Failed to remove stale public asset {:?}: {}", path, e);
+                } else {
+                    tracing::debug!("Removed stale public asset: {:?}", path);
+                    *removed_count += 1;
+                }
+            }
+        }
     }
 }
 
@@ -7154,4 +7294,34 @@ fn value_to_plist_xml(value: &serde_json::Value, indent: usize) -> String {
         }
         serde_json::Value::Null => String::new(),
     }
+}
+
+/// Normalize a path by resolving `.` and `..` components without requiring the path to exist.
+/// This is similar to `std::fs::canonicalize` but works on non-existent paths.
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut components = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                // Pop the last component if possible
+                if !components.is_empty()
+                    && !matches!(
+                        components.last(),
+                        Some(std::path::Component::ParentDir) | Some(std::path::Component::RootDir)
+                    )
+                {
+                    components.pop();
+                } else {
+                    components.push(component);
+                }
+            }
+            std::path::Component::CurDir => {
+                // Skip `.` components
+            }
+            _ => {
+                components.push(component);
+            }
+        }
+    }
+    components.iter().collect()
 }

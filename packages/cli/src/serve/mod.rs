@@ -12,12 +12,18 @@ mod runner;
 mod server;
 mod update;
 
-use anyhow::bail;
+use anyhow::{anyhow, bail, Error};
 use dioxus_dx_wire_format::BuildStage;
 pub(crate) use output::*;
 pub(crate) use runner::*;
 pub(crate) use server::*;
+use tokio::sync::mpsc;
 pub(crate) use update::*;
+
+enum ServeLoopUpdate {
+    Serve(ServeUpdate),
+    HotpatchComputed(Result<HotpatchComputed>),
+}
 
 /// For *all* builds, the CLI spins up a dedicated webserver, file watcher, and build infrastructure to serve the project.
 ///
@@ -68,6 +74,7 @@ pub(crate) async fn serve_all(args: ServeArgs, tracer: &TraceController) -> Resu
     );
 
     builder.initialize();
+    let (hotpatch_tx, mut hotpatch_rx) = mpsc::unbounded_channel::<Result<HotpatchComputed>>();
 
     loop {
         // Draw the state of the server to the screen
@@ -75,14 +82,57 @@ pub(crate) async fn serve_all(args: ServeArgs, tracer: &TraceController) -> Resu
 
         // And then wait for any updates before redrawing
         let msg = tokio::select! {
-            msg = builder.wait() => msg,
-            msg = devserver.wait() => msg,
-            msg = screen.wait() => msg,
-            msg = tracer.wait() => msg,
+            msg = builder.wait() => ServeLoopUpdate::Serve(msg),
+            msg = devserver.wait() => ServeLoopUpdate::Serve(msg),
+            msg = screen.wait() => ServeLoopUpdate::Serve(msg),
+            msg = tracer.wait() => ServeLoopUpdate::Serve(msg),
+            Some(msg) = hotpatch_rx.recv() => ServeLoopUpdate::HotpatchComputed(msg),
         };
 
         match msg {
-            ServeUpdate::FilesChanged { files } => {
+            ServeLoopUpdate::HotpatchComputed(result) => match result {
+                Ok(computed) => {
+                    let elapsed = computed
+                        .bundle
+                        .time_end
+                        .duration_since(computed.bundle.time_start)
+                        .unwrap_or_default();
+
+                    let result = match builder
+                        .finish_computed_hotpatch(
+                            computed.id,
+                            &computed.bundle,
+                            computed.jump_table,
+                        )
+                        .await
+                    {
+                        Ok(jump_table) => {
+                            builder
+                                .send_hotpatch_patch(
+                                    computed.id,
+                                    elapsed,
+                                    jump_table,
+                                    &mut devserver,
+                                )
+                                .await
+                        }
+                        Err(err) => Err(err),
+                    };
+
+                    match result {
+                        Ok(()) => {}
+                        Err(err) => {
+                            handle_hotpatch_error(&mut builder, &mut devserver, err).await;
+                        }
+                    }
+
+                    process_pending_changes(&mut builder, &mut devserver).await;
+                }
+                Err(err) => {
+                    handle_hotpatch_error(&mut builder, &mut devserver, err).await;
+                }
+            },
+            ServeLoopUpdate::Serve(ServeUpdate::FilesChanged { files }) => {
                 if files.is_empty() || !builder.hot_reload {
                     continue;
                 }
@@ -90,7 +140,7 @@ pub(crate) async fn serve_all(args: ServeArgs, tracer: &TraceController) -> Resu
                 builder.handle_file_change(&files, &mut devserver).await;
             }
 
-            ServeUpdate::RequestRebuild => {
+            ServeLoopUpdate::Serve(ServeUpdate::RequestRebuild) => {
                 // The spacing here is important-ish: we want
                 // `Full rebuild:` to line up with
                 // `Hotreloading:` to keep the alignment during long edit sessions
@@ -103,11 +153,11 @@ pub(crate) async fn serve_all(args: ServeArgs, tracer: &TraceController) -> Resu
 
             // Run the server in the background
             // Waiting for updates here lets us tap into when clients are added/removed
-            ServeUpdate::NewConnection {
+            ServeLoopUpdate::Serve(ServeUpdate::NewConnection {
                 id,
                 aslr_reference,
                 pid,
-            } => {
+            }) => {
                 devserver
                     .send_hotreload(builder.applied_hot_reload_changes(BuildId::PRIMARY))
                     .await;
@@ -123,14 +173,14 @@ pub(crate) async fn serve_all(args: ServeArgs, tracer: &TraceController) -> Resu
 
             // Received a message from the devtools server - currently we only use this for
             // logging, so we just forward it the tui
-            ServeUpdate::WsMessage { msg, bundle } => {
+            ServeLoopUpdate::Serve(ServeUpdate::WsMessage { msg, bundle }) => {
                 screen.push_ws_message(bundle, &msg);
             }
 
             // Wait for logs from the build engine
             // These will cause us to update the screen
             // We also can check the status of the builds here in case we have multiple ongoing builds
-            ServeUpdate::BuilderUpdate { id, update } => {
+            ServeLoopUpdate::Serve(ServeUpdate::BuilderUpdate { id, update }) => {
                 let bundle_format = builder.get_build(id).unwrap().build.bundle;
 
                 // Queue any logs to be printed if need be
@@ -173,44 +223,45 @@ pub(crate) async fn serve_all(args: ServeArgs, tracer: &TraceController) -> Resu
                             return Err(err);
                         }
                     }
-                    BuilderUpdate::BuildReady { bundle } => {
-                        match bundle.mode {
-                            BuildMode::Thin { ref cache, .. } => {
-                                if let Err(err) =
-                                    builder.hotpatch(&bundle, id, cache, &mut devserver).await
-                                {
-                                    tracing::error!("Failed to hot-patch app: {err}");
+                    BuilderUpdate::BuildReady { bundle } => match bundle.mode {
+                        BuildMode::Thin { ref cache, .. } => {
+                            if let Err(err) = builder.prepare_hotpatch_state(&bundle, id).await {
+                                handle_hotpatch_error(&mut builder, &mut devserver, err).await;
+                                continue;
+                            }
 
-                                    if let Some(_patching) =
-                                        err.downcast_ref::<crate::build::PatchError>()
-                                    {
-                                        tracing::info!("Starting full rebuild: {err}");
-                                        builder.full_rebuild().await;
-                                        devserver.send_reload_start().await;
-                                        devserver.start_build().await;
-                                    }
+                            match builder.prepare_hotpatch_compute(
+                                bundle.clone(),
+                                id,
+                                cache.clone(),
+                            ) {
+                                Ok(plan) => {
+                                    let tx = hotpatch_tx.clone();
+                                    tokio::spawn(async move {
+                                        let result =
+                                            tokio::task::spawn_blocking(move || plan.compute())
+                                                .await
+                                                .map_err(|err| {
+                                                    anyhow!("Hotpatch worker failed: {err}")
+                                                })
+                                                .and_then(|result| result);
+
+                                        _ = tx.send(result);
+                                    });
+                                }
+                                Err(err) => {
+                                    handle_hotpatch_error(&mut builder, &mut devserver, err).await;
                                 }
                             }
-                            BuildMode::Base { .. } | BuildMode::Fat => {
-                                _ = builder
-                                    .open(&bundle, &mut devserver)
-                                    .await
-                                    .inspect_err(|e| tracing::error!("Failed to open app: {}", e));
-                            }
                         }
-
-                        // Process any file changes that were queued while the build was in progress.
-                        // This handles tools like stylance, tailwind, or sass that generate files
-                        // in response to source changes - those changes would otherwise be lost.
-                        let pending = builder.take_pending_file_changes();
-                        if !pending.is_empty() {
-                            tracing::debug!(
-                                "Processing {} pending file changes after build",
-                                pending.len()
-                            );
-                            builder.handle_file_change(&pending, &mut devserver).await;
+                        BuildMode::Base { .. } | BuildMode::Fat => {
+                            _ = builder
+                                .open(&bundle, &mut devserver)
+                                .await
+                                .inspect_err(|e| tracing::error!("Failed to open app: {}", e));
+                            process_pending_changes(&mut builder, &mut devserver).await;
                         }
-                    }
+                    },
                     BuilderUpdate::StdoutReceived { msg } => {
                         screen.push_stdio(bundle_format, msg, tracing::Level::INFO);
                     }
@@ -244,11 +295,11 @@ pub(crate) async fn serve_all(args: ServeArgs, tracer: &TraceController) -> Resu
                 }
             }
 
-            ServeUpdate::TracingLog { log } => {
+            ServeLoopUpdate::Serve(ServeUpdate::TracingLog { log }) => {
                 screen.push_log(log);
             }
 
-            ServeUpdate::OpenApp => match builder.use_hotpatch_engine {
+            ServeLoopUpdate::Serve(ServeUpdate::OpenApp) => match builder.use_hotpatch_engine {
                 true if !matches!(builder.client.build.bundle, BundleFormat::Web) => {
                     tracing::warn!(
                         "Opening a native app with hotpatching enabled requires a full rebuild..."
@@ -267,11 +318,11 @@ pub(crate) async fn serve_all(args: ServeArgs, tracer: &TraceController) -> Resu
                 }
             },
 
-            ServeUpdate::Redraw => {
+            ServeLoopUpdate::Serve(ServeUpdate::Redraw) => {
                 // simply returning will cause a redraw
             }
 
-            ServeUpdate::ToggleShouldRebuild => {
+            ServeLoopUpdate::Serve(ServeUpdate::ToggleShouldRebuild) => {
                 use crate::styles::{ERROR, NOTE_STYLE};
                 builder.automatic_rebuilds = !builder.automatic_rebuilds;
                 tracing::info!(
@@ -284,11 +335,11 @@ pub(crate) async fn serve_all(args: ServeArgs, tracer: &TraceController) -> Resu
                 )
             }
 
-            ServeUpdate::OpenDebugger { id } => {
+            ServeLoopUpdate::Serve(ServeUpdate::OpenDebugger { id }) => {
                 builder.open_debugger(&devserver, id).await;
             }
 
-            ServeUpdate::Exit { error } => {
+            ServeLoopUpdate::Serve(ServeUpdate::Exit { error }) => {
                 _ = builder.shutdown().await;
                 _ = devserver.shutdown().await;
 
@@ -298,5 +349,30 @@ pub(crate) async fn serve_all(args: ServeArgs, tracer: &TraceController) -> Resu
                 }
             }
         }
+    }
+}
+
+async fn process_pending_changes(builder: &mut AppServer, devserver: &mut WebServer) {
+    // Process file changes that arrived while a build was in progress.
+    // This handles tools like stylance, tailwind, or sass that generate files
+    // in response to source changes - those changes would otherwise be lost.
+    let pending = builder.take_pending_file_changes();
+    if !pending.is_empty() {
+        tracing::debug!(
+            "Processing {} pending file changes after build",
+            pending.len()
+        );
+        builder.handle_file_change(&pending, devserver).await;
+    }
+}
+
+async fn handle_hotpatch_error(builder: &mut AppServer, devserver: &mut WebServer, err: Error) {
+    tracing::error!("Failed to hot-patch app: {err}");
+
+    if let Some(_patching) = err.downcast_ref::<crate::build::PatchError>() {
+        tracing::info!("Starting full rebuild: {err}");
+        builder.full_rebuild().await;
+        devserver.send_reload_start().await;
+        devserver.start_build().await;
     }
 }

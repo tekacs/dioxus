@@ -1277,7 +1277,10 @@ pub fn create_undefined_symbol_stub(
 ///
 /// Unlike the pre-pass, this does not require the linking section — it works purely with walrus
 /// function names (from the name section, preserved by `--keep-debug`).
-pub fn finalize_wasm_base_module(bytes: &[u8]) -> Result<Vec<u8>> {
+pub fn finalize_wasm_base_module(
+    bytes: &[u8],
+    metadata: &super::wasm_hotpatch_metadata::WasmHotpatchMetadata,
+) -> Result<Vec<u8>> {
     let mut module =
         Module::from_buffer(bytes).context("Failed to parse post-bindgen wasm module")?;
 
@@ -1297,32 +1300,26 @@ pub fn finalize_wasm_base_module(bytes: &[u8]) -> Result<Vec<u8>> {
         })
         .collect::<HashMap<_, _>>();
 
-    // Build a map from externref-transformed imports to their shims.
-    // wasm-bindgen's externref pass names shims "{name} externref shim", so we can identify
-    // them precisely rather than guessing based on call graph order.
-    let import_to_shim: HashMap<FunctionId, FunctionId> = {
-        // Map from walrus function name → import FunctionId (for imports that have names)
-        let func_name_to_import: HashMap<&str, FunctionId> = imported_funcs
-            .keys()
-            .filter_map(|&func_id| {
-                let name = module.funcs.get(func_id).name.as_deref()?;
-                Some((name, func_id))
-            })
+    // Build a map from externref-transformed functions to their i32-ABI shims.
+    // Uses the hotpatch metadata emitted by wasm-bindgen (from the externref pass's import_map)
+    // rather than guessing by name suffix. This is reliable because the metadata records the
+    // exact mapping from each transformed import to its shim.
+    let externref_shim_map: HashMap<FunctionId, FunctionId> = {
+        let func_name_to_id: HashMap<&str, FunctionId> = module
+            .funcs
+            .iter()
+            .filter_map(|f| Some((f.name.as_deref()?, f.id())))
             .collect();
 
-        let mut map = HashMap::new();
-        for func in module.funcs.iter() {
-            if let FunctionKind::Local(_) = &func.kind {
-                if let Some(name) = &func.name {
-                    if let Some(base_name) = name.strip_suffix(" externref shim") {
-                        if let Some(&import_func_id) = func_name_to_import.get(base_name) {
-                            map.insert(import_func_id, func.id());
-                        }
-                    }
-                }
-            }
-        }
-        map
+        metadata
+            .externref_shim_map
+            .iter()
+            .filter_map(|(original_name, shim_name)| {
+                let original_id = func_name_to_id.get(original_name.as_str())?;
+                let shim_id = func_name_to_id.get(shim_name.as_str())?;
+                Some((*original_id, *shim_id))
+            })
+            .collect()
     };
 
     let mut exported = HashSet::new();
@@ -1339,7 +1336,7 @@ pub fn finalize_wasm_base_module(bytes: &[u8]) -> Result<Vec<u8>> {
         if name_is_wbg && !name_is_bindgen_symbol(import.name.as_str()) {
             // If there's an externref shim for this import, wrap the shim (i32 ABI).
             // Otherwise wrap the import directly.
-            let call_target = import_to_shim
+            let call_target = externref_shim_map
                 .get(&imported_func)
                 .copied()
                 .unwrap_or(imported_func);
@@ -1378,15 +1375,23 @@ pub fn finalize_wasm_base_module(bytes: &[u8]) -> Result<Vec<u8>> {
 
     // Promote all non-bindgen local functions to the indirect function table so side modules
     // can call them. Skip bindgen descriptor/cast functions to avoid contaminating the ifunc
-    // table (see 718701ec). Also export __saved_wbg_ aliases for __wbindgen intrinsics that
-    // patches may reference, again excluding pure bindgen machinery.
+    // table (see 718701ec). For externref-transformed functions, promote the shim (i32 ABI)
+    // instead of the raw function (externref ABI) so patches can call_indirect with the
+    // original signature.
     for func in module.funcs.iter() {
         if let FunctionKind::Local(_) = &func.kind {
             let id = func.id();
             let is_bindgen = func.name.as_deref().is_some_and(name_is_bindgen_symbol);
+            // Skip externref shims themselves — they'll be added when their original is processed
+            let is_shim = func
+                .name
+                .as_deref()
+                .is_some_and(|n| n.contains(" externref shim"));
 
-            if !is_bindgen && !ifuncs.contains(&id) {
-                make_indirect.push(id);
+            if !is_bindgen && !is_shim && !ifuncs.contains(&id) {
+                // Use the externref shim if available (i32 ABI), otherwise the function itself
+                let promote_id = externref_shim_map.get(&id).copied().unwrap_or(id);
+                make_indirect.push(promote_id);
             }
 
             if let Some(name) = &func.name {
@@ -1400,12 +1405,33 @@ pub fn finalize_wasm_base_module(bytes: &[u8]) -> Result<Vec<u8>> {
         }
     }
 
-    // Append new entries to the ifunc segment.
+    // Fix existing ifunc table entries: replace externref-transformed functions with their
+    // i32-ABI shims so patches can call_indirect with the original signature.
     let segment = module
         .elements
         .iter_mut()
         .last()
         .context("Missing ifunc table")?;
+    match &mut segment.items {
+        ElementItems::Functions(segment_ids) => {
+            for id in segment_ids.iter_mut() {
+                if let Some(&shim_id) = externref_shim_map.get(id) {
+                    *id = shim_id;
+                }
+            }
+        }
+        ElementItems::Expressions(_, exprs) => {
+            for expr in exprs.iter_mut() {
+                if let ConstExpr::RefFunc(id) = expr {
+                    if let Some(&shim_id) = externref_shim_map.get(id) {
+                        *id = shim_id;
+                    }
+                }
+            }
+        }
+    }
+
+    // Append new entries to the ifunc segment.
     let make_indirect_count = make_indirect.len() as u64;
     match &mut segment.items {
         ElementItems::Functions(segment_ids) => {
