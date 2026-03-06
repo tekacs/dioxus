@@ -12,14 +12,13 @@ use std::{
     ops::{Deref, Range},
     path::Path,
     path::PathBuf,
-    sync::{Arc, RwLock},
 };
 use subsecond_types::{AddressMap, JumpTable};
 use target_lexicon::{Architecture, OperatingSystem, PointerWidth, Triple};
 use thiserror::Error;
 use walrus::{
     ConstExpr, DataKind, ElementItems, ElementKind, FunctionBuilder, FunctionId, FunctionKind,
-    ImportKind, Module, ModuleConfig, TableId,
+    ImportKind, Module, RefType, TableId,
 };
 use wasmparser::{
     BinaryReader, BinaryReaderError, Linking, LinkingSectionReader, Payload, SymbolInfo,
@@ -521,7 +520,7 @@ pub fn create_wasm_jump_table(patch: &Path, cache: &HotpatchModuleCache) -> Resu
     // linker can still expect some form of interposition to happen, requiring the symbol *actually*
     // exists.
     //
-    // Our technique here takes advantage of that and the [`prepare_wasm_base_module`] function promotes
+    // Our technique here takes advantage of the fat-build base-module finalizer promoting
     // every possible function to the indirect function table. This means that the GOT imports that
     // `relocation-model=pic` synthesizes can reference the functions via the indirect function table
     // even if they are not normally synthesized in regular wasm code generation.
@@ -824,7 +823,17 @@ fn collect_func_ifuncs(m: &Module) -> HashMap<&str, i32> {
                     }
                 }
             }
-            ElementItems::Expressions(_ref_type, _const_exprs) => {}
+            ElementItems::Expressions(_ref_type, const_exprs) => {
+                for (idx, expr) in const_exprs.iter().enumerate() {
+                    let ConstExpr::RefFunc(id) = expr else {
+                        continue;
+                    };
+
+                    if let Some(name) = m.funcs.get(*id).name.as_deref() {
+                        func_to_offset.insert(name, offset + idx as i32);
+                    }
+                }
+            }
         }
     }
 
@@ -1260,26 +1269,18 @@ pub fn create_undefined_symbol_stub(
     Ok(obj.write()?)
 }
 
-/// Prepares the base module before running wasm-bindgen.
+/// Finalizes the base module after wasm-bindgen has run with `--keep-local-functions`.
 ///
-/// This tries to work around how wasm-bindgen works by intelligently promoting non-wasm-bindgen functions
-/// to the export table.
+/// wasm-bindgen still runs its normal GC and adapter cleanup, but temporarily-rooted local
+/// functions survive. That lets us operate on the final served module, preserving patch-callable
+/// locals and JS bridge shims without keeping dead bindgen descriptor machinery alive.
 ///
-/// It also moves all functions and memories to be callable indirectly.
-pub fn prepare_wasm_base_module(bytes: &[u8]) -> Result<Vec<u8>> {
-    let ParsedModule {
-        mut module,
-        ids,
-        symbols,
-        ..
-    } = parse_module_with_ids(bytes)?;
+/// Unlike the pre-pass, this does not require the linking section — it works purely with walrus
+/// function names (from the name section, preserved by `--keep-debug`).
+pub fn finalize_wasm_base_module(bytes: &[u8]) -> Result<Vec<u8>> {
+    let mut module =
+        Module::from_buffer(bytes).context("Failed to parse post-bindgen wasm module")?;
 
-    // Due to monomorphizations, functions will get merged and multiple names will point to the same function.
-    // Walrus loses this information, so we need to manually parse the names table to get the indices
-    // and names of these functions.
-    //
-    // Unfortunately, the indices it gives us ARE NOT VALID.
-    // We need to work around it by using the FunctionId from the module as a link between the merged function names.
     let ifunc_map = collect_func_ifuncs(&module);
     let ifuncs = module
         .funcs
@@ -1296,22 +1297,54 @@ pub fn prepare_wasm_base_module(bytes: &[u8]) -> Result<Vec<u8>> {
         })
         .collect::<HashMap<_, _>>();
 
-    let mut exported = HashSet::new();
+    // Build a map from externref-transformed imports to their shims.
+    // wasm-bindgen's externref pass names shims "{name} externref shim", so we can identify
+    // them precisely rather than guessing based on call graph order.
+    let import_to_shim: HashMap<FunctionId, FunctionId> = {
+        // Map from walrus function name → import FunctionId (for imports that have names)
+        let func_name_to_import: HashMap<&str, FunctionId> = imported_funcs
+            .keys()
+            .filter_map(|&func_id| {
+                let name = module.funcs.get(func_id).name.as_deref()?;
+                Some((name, func_id))
+            })
+            .collect();
 
-    // Wasm-bindgen will synthesize imports to satisfy its external calls. This facilitates things
-    // like inline-js, snippets, and literally the `#[wasm_bindgen]` macro. All calls to JS are
-    // just `extern "wbg"` blocks!
-    //
-    // However, wasm-bindgen will run a GC pass on the module, removing any unused imports.
+        let mut map = HashMap::new();
+        for func in module.funcs.iter() {
+            if let FunctionKind::Local(_) = &func.kind {
+                if let Some(name) = &func.name {
+                    if let Some(base_name) = name.strip_suffix(" externref shim") {
+                        if let Some(&import_func_id) = func_name_to_import.get(base_name) {
+                            map.insert(import_func_id, func.id());
+                        }
+                    }
+                }
+            }
+        }
+        map
+    };
+
+    let mut exported = HashSet::new();
     let mut make_indirect = vec![];
+
+    // Create __saved_wbg_ wrappers for wbg/wbindgen imports so side modules can call them.
+    // For imports that went through externref transformation, wrap the shim (which has the
+    // original i32 signature) instead of the import (which now has externref signature).
     for (imported_func, importid) in imported_funcs {
         let import = module.imports.get(importid);
         let name_is_wbg =
             import.name.starts_with("__wbindgen") || import.name.starts_with("__wbg_");
 
         if name_is_wbg && !name_is_bindgen_symbol(import.name.as_str()) {
-            let func = module.funcs.get(imported_func);
+            // If there's an externref shim for this import, wrap the shim (i32 ABI).
+            // Otherwise wrap the import directly.
+            let call_target = import_to_shim
+                .get(&imported_func)
+                .copied()
+                .unwrap_or(imported_func);
 
+            let func = module.funcs.get(call_target);
             let ty = module.types.get(func.ty());
             let params = ty.params().to_vec();
             let results = ty.results().to_vec();
@@ -1330,7 +1363,7 @@ pub fn prepare_wasm_base_module(bytes: &[u8]) -> Result<Vec<u8>> {
                 body.local_get(*l);
             }
 
-            body.call(imported_func);
+            body.call(call_target);
 
             let new_func_id = module.funcs.add_local(builder.local_func(locals));
 
@@ -1343,66 +1376,54 @@ pub fn prepare_wasm_base_module(bytes: &[u8]) -> Result<Vec<u8>> {
         }
     }
 
-    for (name, index) in symbols.code_symbol_map.iter() {
-        if name_is_bindgen_symbol(name) {
-            continue;
-        }
-
-        let func = module.funcs.get(ids[*index]);
-
-        // We want to preserve the intrinsics from getting gc-ed out.
-        //
-        // These will create corresponding shim functions in the main module, that the patches will
-        // then call. Wasm-bindgen doesn't actually check if anyone uses the `__wbindgen` exports and
-        // forcefully deletes them literally by checking for symbols that start with `__wbindgen`. We
-        // preserve these symbols by naming them `__saved_wbg_<name>` and then exporting them.
-        //
-        // When wasm-bindgen runs, it will wrap these intrinsics with an `externref shim`, but we
-        // want to preserve the actual underlying function so side modules can call them directly.
-        //
-        // https://github.com/rustwasm/wasm-bindgen/blob/c35cc9369d5e0dc418986f7811a0dd702fb33ef9/crates/cli-support/src/wit/mod.rs#L1505
-        if name.starts_with("__wbindgen") {
-            let saved_name = format!("__saved_wbg_{}", name);
-            if exported.insert(saved_name.clone()) {
-                module.exports.add(&saved_name, func.id());
-            }
-        }
-
-        // This is basically `--export-all` but designed to work around wasm-bindgen not properly gc-ing
-        // imports like __wbindgen_placeholder__ and __wbindgen_externref__
-        //
-        // We only export local functions, and then make sure they can be accessible indirectly.
-        // If we weren't dealing with PIC code, then we could just create local ifuncs in the patch that
-        // call the original function directly. Unfortunately, this would require adding a new relocation
-        // to corresponding GOT.func entry, which we don't want to deal with.
-        //
-        // Note that we don't export via the export table, but rather the ifunc table. This is to work
-        // around issues on large projects where we hit the maximum number of exports.
-        //
-        // https://github.com/emscripten-core/emscripten/issues/22863
+    // Promote all non-bindgen local functions to the indirect function table so side modules
+    // can call them. Skip bindgen descriptor/cast functions to avoid contaminating the ifunc
+    // table (see 718701ec). Also export __saved_wbg_ aliases for __wbindgen intrinsics that
+    // patches may reference, again excluding pure bindgen machinery.
+    for func in module.funcs.iter() {
         if let FunctionKind::Local(_) = &func.kind {
-            if !ifuncs.contains(&func.id()) {
-                make_indirect.push(func.id());
+            let id = func.id();
+            let is_bindgen = func.name.as_deref().is_some_and(name_is_bindgen_symbol);
+
+            if !is_bindgen && !ifuncs.contains(&id) {
+                make_indirect.push(id);
+            }
+
+            if let Some(name) = &func.name {
+                if name.starts_with("__wbindgen") && !is_bindgen {
+                    let saved_name = format!("__saved_wbg_{}", name);
+                    if exported.insert(saved_name.clone()) {
+                        module.exports.add(&saved_name, id);
+                    }
+                }
             }
         }
     }
 
-    // Now we need to make sure to add the new ifuncs to the ifunc segment initializer.
-    // We just assume the last segment is the safest one we can add to which is common practice.
+    // Append new entries to the ifunc segment.
     let segment = module
         .elements
         .iter_mut()
         .last()
         .context("Missing ifunc table")?;
     let make_indirect_count = make_indirect.len() as u64;
-    let ElementItems::Functions(segment_ids) = &mut segment.items else {
-        return Err(PatchError::InvalidModule(
-            "Expected ifunc table to be a function table".into(),
-        ));
-    };
+    match &mut segment.items {
+        ElementItems::Functions(segment_ids) => {
+            for func in make_indirect {
+                segment_ids.push(func);
+            }
+        }
+        ElementItems::Expressions(ref_type, exprs) => {
+            if *ref_type != RefType::Funcref {
+                return Err(PatchError::InvalidModule(
+                    "Expected ifunc table to be a funcref table".into(),
+                ));
+            }
 
-    for func in make_indirect {
-        segment_ids.push(func);
+            for func in make_indirect {
+                exprs.push(ConstExpr::RefFunc(func));
+            }
+        }
     }
 
     if let ElementKind::Active { table, .. } = segment.kind {
@@ -1540,39 +1561,14 @@ struct DataSymbol {
 
 struct ParsedModule<'a> {
     module: Module,
-    ids: Vec<FunctionId>,
     symbols: RawDataSection<'a>,
 }
 
-/// Parse a module and return the mapping of index to FunctionID.
-/// We'll use this mapping to remap ModuleIDs
 fn parse_module_with_ids(bindgened: &[u8]) -> Result<ParsedModule<'_>> {
-    let ids = Arc::new(RwLock::new(Vec::new()));
-    let ids_ = ids.clone();
-    let module = Module::from_buffer_with_config(
-        bindgened,
-        ModuleConfig::new().on_parse(move |_m, our_ids| {
-            let mut ids = ids_.write().expect("No shared writers");
-            let mut idx = 0;
-            while let Ok(entry) = our_ids.get_func(idx) {
-                ids.push(entry);
-                idx += 1;
-            }
-
-            Ok(())
-        }),
-    )?;
-    let mut ids_ = ids.write().expect("No shared writers");
-    let mut ids = vec![];
-    std::mem::swap(&mut ids, &mut *ids_);
-
+    let module = Module::from_buffer(bindgened)?;
     let symbols = parse_bytes_to_data_segment(bindgened).context("Failed to parse data segment")?;
 
-    Ok(ParsedModule {
-        module,
-        ids,
-        symbols,
-    })
+    Ok(ParsedModule { module, symbols })
 }
 
 /// Get the main sentinel symbol for the given target triple

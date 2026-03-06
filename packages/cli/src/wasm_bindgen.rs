@@ -24,6 +24,7 @@ pub(crate) struct WasmBindgen {
     remove_producers_section: bool,
     keep_lld_exports: bool,
     emit_hotpatch_metadata: bool,
+    keep_local_functions: bool,
 }
 
 impl WasmBindgen {
@@ -41,6 +42,7 @@ impl WasmBindgen {
             remove_producers_section: false,
             keep_lld_exports: false,
             emit_hotpatch_metadata: false,
+            keep_local_functions: false,
         }
     }
 
@@ -112,6 +114,13 @@ impl WasmBindgen {
         }
     }
 
+    pub(crate) fn keep_local_functions(self, keep: bool) -> Self {
+        Self {
+            keep_local_functions: keep,
+            ..self
+        }
+    }
+
     /// Run the bindgen command with the current settings
     pub(crate) async fn run(&self) -> Result<std::process::Output> {
         let binary = self.get_binary_path()?;
@@ -152,6 +161,10 @@ impl WasmBindgen {
             args.push("--emit-hotpatch-metadata".to_string());
         }
 
+        if self.keep_local_functions {
+            args.push("--keep-local-functions".to_string());
+        }
+
         // Out name
         args.push("--out-name".to_string());
         args.push(self.out_name.clone());
@@ -180,20 +193,27 @@ impl WasmBindgen {
         // Run bindgen
         let mut output = Command::new(&binary).args(&args).output().await?;
         let mut metadata_flag_supported = self.emit_hotpatch_metadata;
-        if self.emit_hotpatch_metadata
-            && !output.status.success()
-            && String::from_utf8_lossy(&output.stderr).contains("--emit-hotpatch-metadata")
-        {
-            tracing::warn!(
-                "wasm-bindgen at {} does not support --emit-hotpatch-metadata, retrying without it",
-                binary.display()
-            );
-            metadata_flag_supported = false;
-            let fallback_args = args
-                .into_iter()
-                .filter(|arg| arg != "--emit-hotpatch-metadata")
-                .collect::<Vec<_>>();
-            output = Command::new(binary).args(fallback_args).output().await?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if self.keep_local_functions && stderr.contains("--keep-local-functions") {
+                return Err(anyhow!(
+                    "wasm-bindgen at {} does not support --keep-local-functions, which is required for fat hotpatch builds",
+                    binary.display()
+                ));
+            }
+
+            if self.emit_hotpatch_metadata && stderr.contains("--emit-hotpatch-metadata") {
+                tracing::warn!(
+                    "wasm-bindgen at {} does not support --emit-hotpatch-metadata, retrying without it",
+                    binary.display()
+                );
+                metadata_flag_supported = false;
+                let fallback_args = args
+                    .into_iter()
+                    .filter(|arg| arg != "--emit-hotpatch-metadata")
+                    .collect::<Vec<_>>();
+                output = Command::new(binary).args(fallback_args).output().await?;
+            }
         }
 
         // Check for errors

@@ -5018,13 +5018,6 @@ impl BuildRequest {
         _ = std::fs::remove_dir_all(&bindgen_outdir);
         std::fs::create_dir_all(&bindgen_outdir)?;
 
-        // Lift the internal functions to exports
-        if ctx.mode == BuildMode::Fat {
-            let unprocessed = std::fs::read(exe)?;
-            let all_exported_bytes = crate::build::prepare_wasm_base_module(&unprocessed)?;
-            std::fs::write(exe, all_exported_bytes)?;
-        }
-
         // Prepare our configuration
         //
         // we turn on debug symbols in dev mode
@@ -5063,6 +5056,7 @@ impl BuildRequest {
             .keep_debug(keep_debug)
             .keep_lld_sections(true)
             .emit_hotpatch_metadata(ctx.mode == BuildMode::Fat)
+            .keep_local_functions(ctx.mode == BuildMode::Fat)
             .out_name(self.executable_name())
             .out_dir(&bindgen_outdir)
             .remove_name_section(!keep_names)
@@ -5162,6 +5156,15 @@ impl BuildRequest {
             // This will overwrite the file in place
             // We will wasm-opt it in just a second...
             std::fs::write(&post_bindgen_wasm, modules.main.bytes).unwrap();
+        }
+
+        // Lift internal functions to exports and create __saved_wbg_ wrappers for side modules.
+        // This runs post-bindgen after wasm-bindgen has already cleaned up its own dead imports
+        // and adapter machinery, while fat mode's `--keep-local-functions` keeps local Rust code alive.
+        if ctx.mode == BuildMode::Fat {
+            let bindgened = std::fs::read(&post_bindgen_wasm)?;
+            let finalized = crate::build::finalize_wasm_base_module(&bindgened)?;
+            std::fs::write(&post_bindgen_wasm, finalized)?;
         }
 
         if matches!(ctx.mode, BuildMode::Fat) {
