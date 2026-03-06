@@ -22,8 +22,6 @@ mod patch;
 mod renderer;
 mod request;
 
-mod android;
-
 pub(crate) use android::AndroidTools;
 pub(crate) use assets::*;
 pub(crate) use builder::*;
