@@ -1,6 +1,6 @@
 use super::{AppBuilder, ServeUpdate, WebServer};
 use crate::{
-    BuildArtifacts, BuildId, BuildMode, BuildTargets, BuilderUpdate, BundleFormat,
+    BuildArtifacts, BuildId, BuildMode, BuildRequest, BuildTargets, BuilderUpdate, BundleFormat,
     HotpatchModuleCache, Result, ServeArgs, TailwindCli, TraceSrc, Workspace,
     platform_override::CommandWithPlatformOverrides,
 };
@@ -19,7 +19,7 @@ use futures_util::future::OptionFuture;
 use krates::NodeId;
 use notify::{
     Config, EventKind, RecursiveMode, Watcher as NotifyWatcher,
-    event::{MetadataKind, ModifyKind},
+    event::{AccessKind, AccessMode, ModifyKind},
 };
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -28,6 +28,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+use subsecond_types::JumpTable;
 use syn::spanned::Spanned;
 use tokio::process::Command;
 
@@ -50,6 +51,8 @@ pub(crate) struct AppServer {
     pub(crate) watcher: Box<dyn notify::Watcher>,
     pub(crate) _watcher_tx: UnboundedSender<notify::Event>,
     pub(crate) watcher_rx: UnboundedReceiver<notify::Event>,
+    pub(crate) recursive_watch_roots: HashSet<PathBuf>,
+    pub(crate) nonrecursive_watch_roots: HashSet<PathBuf>,
 
     // Tracked state related to open builds and hot reloading
     pub(crate) applied_client_hot_reload_message: HotReloadMsg,
@@ -107,6 +110,32 @@ pub(crate) enum HotReloadMode {
     Disabled,
 }
 
+#[derive(Clone)]
+pub(crate) struct HotpatchComputePlan {
+    pub(crate) id: BuildId,
+    pub(crate) bundle: BuildArtifacts,
+    pub(crate) build: BuildRequest,
+    pub(crate) cache: Arc<HotpatchModuleCache>,
+}
+
+pub(crate) struct HotpatchComputed {
+    pub(crate) id: BuildId,
+    pub(crate) bundle: BuildArtifacts,
+    pub(crate) jump_table: JumpTable,
+}
+
+impl HotpatchComputePlan {
+    pub(crate) fn compute(self) -> Result<HotpatchComputed> {
+        let patch = self.build.patch_exe(self.bundle.time_start);
+        let jump_table = self.build.create_jump_table(&patch, &self.cache)?;
+        Ok(HotpatchComputed {
+            id: self.id,
+            bundle: self.bundle,
+            jump_table,
+        })
+    }
+}
+
 impl AppServer {
     /// Create the AppRunner and then initialize the filemap with the crate directory.
     pub(crate) async fn new(args: ServeArgs) -> Result<Self> {
@@ -116,6 +145,7 @@ impl AppServer {
         let interactive = args.is_interactive_tty();
         let force_sequential = args.platform_args.shared.targets.force_sequential_build();
         let cross_origin_policy = args.cross_origin_policy;
+        let stdin_watch = args.stdin_watch;
 
         // Find the launch args for the client and server
         let split_args = |args: &str| {
@@ -154,9 +184,14 @@ impl AppServer {
             .port
             .unwrap_or_else(|| get_available_port(devserver_bind_ip, Some(8080)).unwrap_or(8080));
 
-        // Spin up the file watcher
+        // Spin up the file watcher (or stdin-based watcher if --stdin-watch)
         let (watcher_tx, watcher_rx) = futures_channel::mpsc::unbounded();
-        let watcher = create_notify_watcher(watcher_tx.clone(), wsl_file_poll_interval as u64);
+        let watcher: Box<dyn NotifyWatcher> = if stdin_watch {
+            spawn_stdin_watch_reader(watcher_tx.clone());
+            create_noop_watcher()
+        } else {
+            create_notify_watcher(watcher_tx.clone(), wsl_file_poll_interval as u64)
+        };
 
         let ssg = args.platform_args.shared.targets.ssg;
         let target_args = CommandWithPlatformOverrides {
@@ -182,7 +217,7 @@ impl AppServer {
             .then(|| get_available_port(devserver_bind_ip, None))
             .flatten();
 
-        let watch_fs = args.watch.unwrap_or(true);
+        let watch_fs = args.watch.unwrap_or(true) || stdin_watch;
         let hotreload_mode = if args.hot_patch.unwrap_or(true) {
             HotReloadMode::Hotpatch
         } else {
@@ -221,6 +256,8 @@ impl AppServer {
             watcher,
             watcher_rx,
             _watcher_tx: watcher_tx,
+            recursive_watch_roots: Default::default(),
+            nonrecursive_watch_roots: Default::default(),
             interactive,
             _force_sequential: force_sequential,
             cross_origin_policy,
@@ -237,9 +274,12 @@ impl AppServer {
 
         // Only register the hot-reload stuff if we're watching the filesystem
         if runner.watch_fs {
-            // Spin up the notify watcher
-            // When builds load though, we're going to parse their depinfo and add the paths to the watcher
-            runner.watch_filesystem();
+            // When using stdin_watch, skip the built-in filesystem watcher setup — the external
+            // process will send us file change events. We still load the RSX filemap so hot reload
+            // diffing works.
+            if !stdin_watch {
+                runner.watch_filesystem();
+            }
 
             // todo(jon): this might take a while so we should try and background it, or make it lazy somehow
             // we could spawn a thread to search the FS and then when it returns we can fill the filemap
@@ -338,6 +378,7 @@ impl AppServer {
 
                 // Filter the changes
                 let mut files: Vec<PathBuf> = vec![];
+                let mut deferred_zero_len_files: Vec<PathBuf> = vec![];
 
                 // Decompose the events into a list of all the files that have changed
                 for event in changes.drain(..) {
@@ -351,18 +392,39 @@ impl AppServer {
                     }
 
                     for path in event.paths {
-                        // Workaround for notify and vscode-like editor:
-                        // - when edit & save a file in vscode, there will be two notifications,
-                        // - the first one is a file with empty content.
-                        // - filter the empty file notification to avoid false rebuild during hot-reload
-                        if let Ok(metadata) = std::fs::metadata(&path) {
-                            if metadata.len() == 0 {
+                        // Some editors and tools can emit an event while a file is transiently empty
+                        // (truncate + write). Defer these paths and check them again shortly.
+                        match std::fs::metadata(&path) {
+                            Ok(metadata) if metadata.is_file() && metadata.len() == 0 => {
+                                deferred_zero_len_files.push(path);
                                 continue;
                             }
+                            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                                deferred_zero_len_files.push(path);
+                                continue;
+                            }
+                            _ => {}
                         }
 
                         files.push(path);
                     }
+                }
+
+                if !deferred_zero_len_files.is_empty() {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    files.extend(deferred_zero_len_files);
+                }
+
+                // Check for the stdin-watch "force rebuild" sentinel.
+                // If present alongside real file changes, queue them as pending
+                // (handle_file_change will see them after the rebuild completes).
+                static REBUILD_SENTINEL: &str = "__rurere_force_rebuild__";
+                if files.iter().any(|p| p.as_os_str() == REBUILD_SENTINEL) {
+                    files.retain(|p| p.as_os_str() != REBUILD_SENTINEL);
+                    if !files.is_empty() {
+                        self.pending_file_changes.extend(files);
+                    }
+                    return ServeUpdate::RequestRebuild;
                 }
 
                 ServeUpdate::FilesChanged { files }
@@ -713,6 +775,12 @@ impl AppServer {
             _ => {}
         }
 
+        // Watch paths from depinfo so we can trigger rebuilds when dependencies change
+        // This handles directories added via cargo:rerun-if-changed in build.rs
+        if self.watch_fs {
+            self.watch_depinfo_paths(artifacts);
+        }
+
         let should_open = self.client.stage == BuildStage::Success
             && (self.server.as_ref().map(|s| s.stage == BuildStage::Success)).unwrap_or(true);
 
@@ -861,30 +929,74 @@ impl AppServer {
         self.clear_patches();
     }
 
-    pub(crate) async fn hotpatch(
+    pub(crate) fn prepare_hotpatch_compute(
+        &self,
+        bundle: BuildArtifacts,
+        id: BuildId,
+        cache: Arc<HotpatchModuleCache>,
+    ) -> Result<HotpatchComputePlan> {
+        let build = match id {
+            BuildId::PRIMARY => self.client.build.clone(),
+            BuildId::SECONDARY => self
+                .server
+                .as_ref()
+                .context("Server not found")?
+                .build
+                .clone(),
+            _ => bail!("Invalid build id"),
+        };
+        Ok(HotpatchComputePlan {
+            id,
+            bundle,
+            build,
+            cache,
+        })
+    }
+
+    pub(crate) async fn prepare_hotpatch_state(
         &mut self,
         bundle: &BuildArtifacts,
         id: BuildId,
-        cache: &HotpatchModuleCache,
-        devserver: &mut WebServer,
     ) -> Result<()> {
-        let elapsed = bundle
-            .time_end
-            .duration_since(bundle.time_start)
-            .unwrap_or_default();
-
-        let jump_table = match id {
-            BuildId::PRIMARY => self.client.hotpatch(bundle, cache).await,
+        match id {
+            BuildId::PRIMARY => self.client.prepare_hotpatch(bundle).await,
             BuildId::SECONDARY => {
                 self.server
                     .as_mut()
                     .context("Server not found")?
-                    .hotpatch(bundle, cache)
+                    .prepare_hotpatch(bundle)
                     .await
             }
             _ => bail!("Invalid build id"),
-        }?;
+        }
+    }
 
+    pub(crate) async fn finish_computed_hotpatch(
+        &mut self,
+        id: BuildId,
+        bundle: &BuildArtifacts,
+        jump_table: JumpTable,
+    ) -> Result<JumpTable> {
+        match id {
+            BuildId::PRIMARY => self.client.finish_hotpatch(bundle, jump_table).await,
+            BuildId::SECONDARY => {
+                self.server
+                    .as_mut()
+                    .context("Server not found")?
+                    .finish_hotpatch(bundle, jump_table)
+                    .await
+            }
+            _ => bail!("Invalid build id"),
+        }
+    }
+
+    pub(crate) async fn send_hotpatch_patch(
+        &mut self,
+        id: BuildId,
+        elapsed: Duration,
+        jump_table: JumpTable,
+        devserver: &mut WebServer,
+    ) -> Result<()> {
         if id == BuildId::PRIMARY {
             self.applied_client_hot_reload_message.jump_table = self.client.patches.last().cloned();
         }
@@ -1193,48 +1305,93 @@ impl AppServer {
             self.client.build.crate_dir(),
             self.client.build.crate_package,
         ) {
-            if let Err(err) = self.watcher.watch(&path, RecursiveMode::Recursive) {
-                handle_notify_error(err);
-            }
+            self.watch_path(path, RecursiveMode::Recursive);
         }
 
         // Watch additional paths from [web.watcher].watch_path config
         let crate_dir = self.client.build.crate_dir();
-        for watch_path in &self.client.build.config.web.watcher.watch_path {
+        let configured_watch_paths = self.client.build.config.web.watcher.watch_path.clone();
+        for watch_path in configured_watch_paths {
             let path = crate_dir.join(watch_path);
             if path.exists() {
-                tracing::trace!("Watching configured path {path:?}");
-                if let Err(err) = self.watcher.watch(&path, RecursiveMode::Recursive) {
-                    handle_notify_error(err);
-                }
+                self.watch_path(path, RecursiveMode::Recursive);
             }
         }
 
         if let Some(server) = self.server.as_ref() {
             // Watch the server's crate directory as well
-            for path in self.watch_paths(server.build.crate_dir(), server.build.crate_package) {
-                tracing::trace!("Watching path {path:?}");
-
-                if let Err(err) = self.watcher.watch(&path, RecursiveMode::Recursive) {
-                    handle_notify_error(err);
-                }
+            let paths = self.watch_paths(server.build.crate_dir(), server.build.crate_package);
+            for path in paths {
+                self.watch_path(path, RecursiveMode::Recursive);
             }
         }
 
         // Also watch the crates themselves, but not recursively, such that we can pick up new folders
         for krate in self.all_watched_crates() {
-            if let Err(err) = self.watcher.watch(&krate, RecursiveMode::NonRecursive) {
-                handle_notify_error(err);
-            }
+            self.watch_path(krate, RecursiveMode::NonRecursive);
         }
 
         // Also watch the workspace dir, non recursively, such that we can pick up new folders there too
-        if let Err(err) = self.watcher.watch(
-            self.workspace.krates.workspace_root().as_std_path(),
-            RecursiveMode::NonRecursive,
-        ) {
+        let workspace_root = self
+            .workspace
+            .krates
+            .workspace_root()
+            .as_std_path()
+            .to_path_buf();
+        self.watch_path(workspace_root, RecursiveMode::NonRecursive);
+    }
+
+    /// Watch paths from depinfo after a build completes.
+    /// This catches build inputs outside the normal workspace watch frontier,
+    /// including directories added via cargo:rerun-if-changed in build.rs.
+    fn watch_depinfo_paths(&mut self, artifacts: &BuildArtifacts) {
+        for path in &artifacts.depinfo.files {
+            let Ok(path) = canonical_existing_path(path) else {
+                continue;
+            };
+
+            if self.path_covered_by_recursive_watch(&path) {
+                continue;
+            }
+
+            let mode = if path.is_dir() {
+                RecursiveMode::Recursive
+            } else {
+                RecursiveMode::NonRecursive
+            };
+
+            self.watch_path(path, mode);
+        }
+    }
+
+    fn watch_path(&mut self, path: impl AsRef<Path>, mode: RecursiveMode) {
+        let Ok(path) = canonical_existing_path(path.as_ref()) else {
+            return;
+        };
+
+        let roots = match mode {
+            RecursiveMode::Recursive => &mut self.recursive_watch_roots,
+            RecursiveMode::NonRecursive => &mut self.nonrecursive_watch_roots,
+        };
+
+        if !roots.insert(path.clone()) {
+            return;
+        }
+
+        tracing::trace!("Watching path {path:?}");
+        if let Err(err) = self.watcher.watch(&path, mode) {
             handle_notify_error(err);
         }
+    }
+
+    fn path_covered_by_recursive_watch(&self, path: &Path) -> bool {
+        self.recursive_watch_roots.iter().any(|root| {
+            if root.is_file() {
+                path == root
+            } else {
+                path.starts_with(root)
+            }
+        })
     }
 
     /// Return the list of paths that we should watch for changes.
@@ -1826,16 +1983,24 @@ fn create_notify_watcher(
         };
 
         let is_allowed_notify_event = match event.kind {
-            EventKind::Modify(ModifyKind::Data(_)) => true,
-            EventKind::Modify(ModifyKind::Name(_)) => true,
-            // The primary modification event on WSL's poll watcher.
-            EventKind::Modify(ModifyKind::Metadata(MetadataKind::WriteTime)) => true,
-            // Catch-all for unknown event types (windows)
-            EventKind::Modify(ModifyKind::Any) => true,
-            EventKind::Modify(ModifyKind::Metadata(_)) => false,
-            // Don't care about anything else.
-            EventKind::Create(_) => true,
-            EventKind::Remove(_) => true,
+            // Some backends report imprecise "Any" events for real writes.
+            EventKind::Any => true,
+            EventKind::Modify(
+                // Includes metadata/name/data changes; different editors and tools map writes
+                // to different modify sub-kinds depending on backend.
+                ModifyKind::Data(_)
+                | ModifyKind::Name(_)
+                | ModifyKind::Metadata(_)
+                | ModifyKind::Any
+                | ModifyKind::Other,
+            ) => true,
+            // Many "write then close" workflows only surface as access-close(write).
+            EventKind::Access(AccessKind::Close(
+                AccessMode::Write | AccessMode::Any | AccessMode::Other,
+            ))
+            | EventKind::Access(AccessKind::Any) => true,
+            // Create/remove still indicate actionable file churn.
+            EventKind::Create(_) | EventKind::Remove(_) => true,
             _ => false,
         };
 
@@ -1861,6 +2026,104 @@ fn create_notify_watcher(
     Box::new(notify::recommended_watcher(handler).expect(NOTIFY_ERROR_MSG))
 }
 
+/// Create a no-op watcher that doesn't actually watch anything.
+/// Used when --stdin-watch is active and an external process drives file change events.
+fn create_noop_watcher() -> Box<dyn NotifyWatcher> {
+    // A PollWatcher with a very long interval that never watches any paths acts as a no-op.
+    // We need a real Watcher instance because AppServer stores it as Box<dyn Watcher>.
+    Box::new(
+        notify::PollWatcher::new(
+            |_: notify::Result<notify::Event>| {},
+            Config::default().with_poll_interval(Duration::from_secs(86400)),
+        )
+        .expect("Failed to create no-op watcher"),
+    )
+}
+
+/// JSON protocol for --stdin-watch. One JSON object per line.
+#[derive(serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum StdinWatchEvent {
+    /// File(s) changed — fed into the hot reload pipeline.
+    Change { paths: Vec<PathBuf> },
+    /// Force a full rebuild (equivalent to pressing 'r').
+    Rebuild,
+}
+
+/// Spawn a tokio task that reads JSON lines from stdin and injects them into the watcher channel.
+///
+/// - `{"kind":"change","paths":["src/foo.rs"]}` → `notify::Event(Modify)` for each path
+/// - `{"kind":"rebuild"}` → sentinel event that `wait()` converts to `RequestRebuild`
+fn spawn_stdin_watch_reader(tx: UnboundedSender<notify::Event>) {
+    // Resolve cwd once at startup so relative paths from the external driver
+    // are canonicalized to the absolute paths the serve pipeline expects.
+    let cwd = std::env::current_dir().unwrap_or_default();
+
+    tokio::spawn(async move {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let stdin = tokio::io::stdin();
+        let mut reader = BufReader::new(stdin);
+        let mut line = String::new();
+
+        loop {
+            line.clear();
+            match reader.read_line(&mut line).await {
+                Ok(0) => break, // EOF — stdin closed
+                Ok(_) => {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    match serde_json::from_str::<StdinWatchEvent>(trimmed) {
+                        Ok(StdinWatchEvent::Change { paths }) => {
+                            // Canonicalize paths: the serve pipeline compares against absolute
+                            // workspace paths (file_map keys, depinfo, etc.), so relative inputs
+                            // must be resolved against cwd.
+                            let paths = paths
+                                .into_iter()
+                                .map(|p| if p.is_absolute() { p } else { cwd.join(&p) })
+                                .collect();
+                            let event = notify::Event {
+                                kind: EventKind::Modify(ModifyKind::Data(
+                                    notify::event::DataChange::Content,
+                                )),
+                                paths,
+                                attrs: Default::default(),
+                            };
+                            if tx.unbounded_send(event).is_err() {
+                                break;
+                            }
+                        }
+                        Ok(StdinWatchEvent::Rebuild) => {
+                            // Send a synthetic event with a sentinel path that wait() can detect.
+                            // We use a path that can't exist as a real file.
+                            let event = notify::Event {
+                                kind: EventKind::Modify(ModifyKind::Data(
+                                    notify::event::DataChange::Content,
+                                )),
+                                paths: vec![PathBuf::from("__rurere_force_rebuild__")],
+                                attrs: Default::default(),
+                            };
+                            if tx.unbounded_send(event).is_err() {
+                                break;
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!("stdin-watch: invalid JSON: {err}: {trimmed}");
+                        }
+                    }
+                }
+                Err(err) => {
+                    tracing::error!("stdin-watch: read error: {err}");
+                    break;
+                }
+            }
+        }
+
+        tracing::info!("stdin-watch: stdin closed, watcher stopped");
+    });
+}
+
 fn handle_notify_error(err: notify::Error) {
     tracing::debug!("Failed to watch path: {}", err);
     match err.kind {
@@ -1872,6 +2135,17 @@ fn handle_notify_error(err: notify::Error) {
         }
         _ => {}
     }
+}
+
+fn canonical_existing_path(path: &Path) -> std::io::Result<PathBuf> {
+    if !path.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "watch path does not exist",
+        ));
+    }
+
+    dunce::canonicalize(path)
 }
 
 /// Detects if `dx` is being ran in a WSL environment.

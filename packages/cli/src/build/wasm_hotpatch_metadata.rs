@@ -9,6 +9,7 @@ pub(crate) struct WasmHotpatchMetadata {
     bindgen_symbol_set: HashSet<String>,
     cast_mappings: HashMap<String, Vec<String>>,
     placeholder_import_names: HashSet<String>,
+    pub(crate) externref_shim_map: HashMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -19,6 +20,15 @@ struct RawWasmHotpatchMetadata {
     cast_mappings: Vec<RawHotpatchCastMapping>,
     #[serde(default)]
     placeholder_import_mappings: Vec<RawHotpatchPlaceholderMapping>,
+    #[serde(default)]
+    externref_import_shims: Vec<RawExternrefShimMapping>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawExternrefShimMapping {
+    #[serde(default)]
+    original_func_name: Option<String>,
+    shim_func_name: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -82,10 +92,17 @@ impl WasmHotpatchMetadata {
             .map(|mapping| mapping.import_name)
             .collect::<HashSet<_>>();
 
+        let externref_shim_map = raw
+            .externref_import_shims
+            .into_iter()
+            .filter_map(|m| Some((m.original_func_name?, m.shim_func_name)))
+            .collect::<HashMap<_, _>>();
+
         Self {
             bindgen_symbol_set,
             cast_mappings,
             placeholder_import_names,
+            externref_shim_map,
         }
     }
 

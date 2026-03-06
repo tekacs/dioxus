@@ -1,6 +1,6 @@
 use crate::{
-    BuildId, BuildStage, BuilderUpdate, BundleFormat, Result, TraceSrc, config::WebHttpsConfig,
-    serve::ServeUpdate,
+    BuildId, BuildStage, BuilderUpdate, BundleFormat, Error, Result, TraceSrc,
+    config::WebHttpsConfig, serve::ServeUpdate,
 };
 use anyhow::{Context, bail};
 use axum::{
@@ -12,7 +12,7 @@ use axum::{
     },
     http::{
         Method, Response, StatusCode,
-        header::{CACHE_CONTROL, EXPIRES, HeaderName, HeaderValue, PRAGMA},
+        header::{CACHE_CONTROL, CONTENT_TYPE, EXPIRES, HeaderName, HeaderValue, PRAGMA},
     },
     middleware::{self, Next},
     response::IntoResponse,
@@ -24,6 +24,7 @@ use futures_util::{
     StreamExt, future,
     stream::{self, FuturesUnordered},
 };
+use html_escape::encode_text;
 use hyper::HeaderMap;
 use rustls::crypto::{CryptoProvider, ring::default_provider};
 use serde::{Deserialize, Serialize};
@@ -71,8 +72,106 @@ pub(crate) struct ConnectedWsClient {
     pid: Option<u32>,
 }
 
+fn render_backend_wait_page(error: &Error) -> String {
+    let escaped_error = encode_text(&format!("{error:#?}")).to_string();
+
+    format!(
+        r#"<!doctype html>
+<html lang=\"en\">
+<head>
+  <meta charset=\"utf-8\" />
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
+  <title>Backend starting...</title>
+  <style>
+    :root {{
+      color-scheme: dark;
+    }}
+
+    body {{
+      margin: 0;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: radial-gradient(circle at 20% 20%, #111827, #0b1220 55%);
+      color: #e5e7eb;
+      font-family: system-ui, -apple-system, Segoe UI, sans-serif;
+      padding: 16px;
+    }}
+
+    main {{
+      width: min(640px, calc(100% - 24px));
+      padding: 28px 26px;
+      text-align: left;
+      background: #0f172a;
+      border: 1px solid #1f2937;
+      border-radius: 14px;
+      box-shadow: 0 16px 46px rgba(0,0,0,0.32);
+    }}
+
+    h1 {{
+      margin: 0 0 8px;
+      font-size: 21px;
+      letter-spacing: 0.2px;
+    }}
+
+    p {{
+      margin: 0 0 14px;
+      font-size: 14px;
+      line-height: 1.6;
+      color: #cbd5e1;
+    }}
+
+    pre {{
+      margin: 0;
+      padding: 12px 14px;
+      background: #0b1220;
+      border: 1px solid #1f2937;
+      border-radius: 10px;
+      color: #e5e7eb;
+      font-size: 13px;
+      line-height: 1.45;
+      white-space: pre-wrap;
+      word-break: break-word;
+      max-height: 320px;
+      overflow: auto;
+    }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Backend starting...</h1>
+    <p>Waiting for the backend to accept connections. This page will reload automatically once it responds.</p>
+    <pre>{escaped_error}</pre>
+  </main>
+  <script>
+    const target = location.href;
+    let delay = 600;
+
+    async function poll() {{
+      try {{
+        const res = await fetch(target, {{ method: 'GET', cache: 'no-store' }});
+        if (res.ok || (res.status >= 300 && res.status < 400)) {{
+          location.reload();
+          return;
+        }}
+      }} catch (e) {{}}
+
+      delay = Math.min(Math.floor(delay * 1.6), 5000);
+      setTimeout(poll, delay);
+    }}
+
+    poll();
+  </script>
+</body>
+</html>
+"#
+    )
+}
+
 impl WebServer {
     pub const SELF_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+    const WS_SEND_TIMEOUT: Duration = Duration::from_millis(500);
 
     /// Start the development server.
     /// This will set up the default http server if there's no server specified (usually via fullstack).
@@ -162,8 +261,15 @@ impl WebServer {
 
                     // Update the socket with project info and current build status
                     let project_info = SharedStatus::new(Status::ClientInit { application_name: self.application_name.clone(), bundle: self.bundle });
-                    if project_info.send_to(&mut new_socket.socket).await.is_ok() {
-                        _ = self.build_status.send_to(&mut new_socket.socket).await;
+                    if tokio::time::timeout(Self::WS_SEND_TIMEOUT, project_info.send_to(&mut new_socket.socket))
+                        .await
+                        .is_ok_and(|result| result.is_ok())
+                    {
+                        _ = tokio::time::timeout(
+                            Self::WS_SEND_TIMEOUT,
+                            self.build_status.send_to(&mut new_socket.socket),
+                        )
+                        .await;
                         self.build_status_sockets.push(new_socket);
                     }
                     return future::pending::<ServeUpdate>().await;
@@ -197,7 +303,14 @@ impl WebServer {
         let mut i = 0;
         while i < self.build_status_sockets.len() {
             let socket = &mut self.build_status_sockets[i];
-            if self.build_status.send_to(&mut socket.socket).await.is_err() {
+            let send_result = tokio::time::timeout(
+                Self::WS_SEND_TIMEOUT,
+                self.build_status.send_to(&mut socket.socket),
+            )
+            .await;
+
+            if !send_result.is_ok_and(|result| result.is_ok()) {
+                tracing::debug!("Dropping stale build-status socket after send timeout/error");
                 self.build_status_sockets.remove(i);
             } else {
                 i += 1;
@@ -285,12 +398,14 @@ impl WebServer {
         let mut i = 0;
         while i < self.hot_reload_sockets.len() {
             let socket = &mut self.hot_reload_sockets[i];
-            if socket
-                .socket
-                .send(Message::Text(msg.clone().into()))
-                .await
-                .is_err()
-            {
+            let send_result = tokio::time::timeout(
+                Self::WS_SEND_TIMEOUT,
+                socket.socket.send(Message::Text(msg.clone().into())),
+            )
+            .await;
+
+            if !send_result.is_ok_and(|result| result.is_ok()) {
+                tracing::debug!("Dropping stale hotreload socket after send timeout/error");
                 self.hot_reload_sockets.remove(i);
             } else {
                 i += 1;
@@ -350,11 +465,19 @@ impl WebServer {
 
     /// Sends a devserver message to all connected clients.
     async fn send_devserver_message_to_all(&mut self, msg: DevserverMsg) {
-        for socket in self.hot_reload_sockets.iter_mut() {
-            _ = socket
-                .socket
-                .send(Message::Text(serde_json::to_string(&msg).unwrap().into()))
-                .await;
+        let msg = Message::Text(serde_json::to_string(&msg).unwrap().into());
+        let mut i = 0;
+        while i < self.hot_reload_sockets.len() {
+            let socket = &mut self.hot_reload_sockets[i];
+            let send_result =
+                tokio::time::timeout(Self::WS_SEND_TIMEOUT, socket.socket.send(msg.clone())).await;
+
+            if !send_result.is_ok_and(|result| result.is_ok()) {
+                tracing::debug!("Dropping stale devserver socket after send timeout/error");
+                self.hot_reload_sockets.remove(i);
+            } else {
+                i += 1;
+            }
         }
     }
 
@@ -483,11 +606,12 @@ fn build_devserver_router(
             format!("http://{address}").parse().unwrap(),
             true,
             |error| {
+                tracing::error!(dx_src = ?TraceSrc::Dev, "Fullstack proxy error: {error:#?}");
+                let body = render_backend_wait_page(&error);
                 Response::builder()
                     .status(StatusCode::INTERNAL_SERVER_ERROR)
-                    .body(Body::from(format!(
-                        "Backend connection failed. The backend is likely still starting up. Please try again in a few seconds. Error: {error:#?}"
-                    )))
+                    .header(CONTENT_TYPE, "text/html; charset=utf-8")
+                    .body(Body::from(body))
                     .unwrap()
             },
         ));

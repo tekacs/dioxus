@@ -64,6 +64,17 @@ pub(crate) struct ServeArgs {
     #[clap(long, default_missing_value = "true", num_args=0..=1)]
     pub(crate) watch: Option<bool>,
 
+    /// Accept file-change events as JSON lines on stdin instead of using the built-in file watcher.
+    ///
+    /// Each line should be one of:
+    ///   {"kind":"change","paths":["src/foo.rs","src/bar.rs"]}
+    ///   {"kind":"rebuild"}
+    ///
+    /// This disables the built-in notify watcher, allowing an external process (e.g. rurere) to
+    /// drive hot reload and rebuilds. Implies --no-interactive.
+    #[clap(long)]
+    pub(crate) stdin_watch: bool,
+
     /// Exit the CLI after running into an error. This is mainly used to test hot patching internally
     #[clap(long)]
     #[clap(hide = true)]
@@ -106,7 +117,8 @@ impl ServeArgs {
     /// Check if the server is running in interactive mode. This involves checking the terminal as well
     pub(crate) fn is_interactive_tty(&self) -> bool {
         use std::io::IsTerminal;
-        std::io::stdout().is_terminal() && self.interactive.unwrap_or(true)
+        // stdin_watch uses stdin for JSON events, so interactive mode is not possible
+        !self.stdin_watch && std::io::stdout().is_terminal() && self.interactive.unwrap_or(true)
     }
 }
 
@@ -122,6 +134,7 @@ impl Anonymized for ServeArgs {
             "interactive": self.interactive,
             "hot_patch": self.hot_patch,
             "watch": self.watch,
+            "stdin_watch": self.stdin_watch,
             "exit_on_error": self.exit_on_error,
             "platform_args": self.platform_args.anonymized(),
         }}

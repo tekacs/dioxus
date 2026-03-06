@@ -755,63 +755,11 @@ impl AppBuilder {
         }
     }
 
-    /// Apply the artifacts produced by a thin (hotpatch) build to the currently running app and
-    /// return a [`JumpTable`] that the runtime can use to swap function pointers in place.
-    ///
-    /// This is the CLI-side counterpart to `subsecond`'s runtime patch loader. A thin build
-    /// produces a self-contained dylib (`patch_exe`) that links against the symbols already
-    /// resident in the running process. To make that dylib actually take effect, this function
-    /// has to do four things, in order:
-    ///
-    /// 1. **Reconcile new assets.** Walks `res.assets` and, for any `asset!()` reference that
-    ///    wasn't in the previous build, processes the source file (via `process_file_to`, which
-    ///    runs the asset through the appropriate optimizer — esbuild for JS/CSS, image
-    ///    re-encoding, etc.) and copies it into the live `asset_dir`. New assets are also
-    ///    inserted into `self.artifacts.assets` so subsequent patches see them as already-known.
-    ///    On Android the asset is additionally `adb push`'d to `/data/local/tmp/dx/assets/...`
-    ///    so the on-device app can read it.
-    ///
-    /// 2. **Extend the file watcher set.** New `include!()` / `include_str!()` / `include_bytes!()`
-    ///    targets discovered in `res.depinfo.files` are appended to the existing artifacts'
-    ///    depinfo so the file watcher will pick up future edits to them.
-    ///
-    /// 3. **Build the jump table.** Calls [`BuildRequest::create_jump_table`] with the new dylib
-    ///    and the [`HotpatchModuleCache`] (which holds the symbol map from the original fat
-    ///    build). The cache is what lets us resolve "function `foo` in the new dylib" to "the
-    ///    address of `foo` in the running process" so the runtime can patch the call sites. On
-    ///    Android the dylib itself is also pushed to the device and `jump_table.lib` is
-    ///    rewritten to point at the on-device path, since the runtime will `dlopen` it from
-    ///    there rather than from the host filesystem.
-    ///
-    /// 4. **Commit local state.** The jump table is appended to `self.patches` (the cumulative
-    ///    history of patches applied to this run of the app — used so that a fresh client
-    ///    connecting mid-session can be brought up to date by replaying every patch in order),
-    ///    and `self.object_cache` is overwritten with `res.object_cache` so the next thin build
-    ///    diffs against the objects this patch produced rather than the previous tip.
-    ///
-    /// The returned [`JumpTable`] is what gets shipped to the runtime over the devserver
-    /// websocket; the runtime then `dlopen`s `jump_table.lib` and rewrites the trampolines
-    /// described by the table.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if there are no prior `artifacts` to patch against (i.e. no fat build
-    /// has completed yet), if `create_jump_table` fails (typically a symbol-resolution failure
-    /// indicating the patch references something that doesn't exist in the base binary), or if
-    /// the Android `adb push` of the dylib fails. Failures while copying individual assets are
-    /// logged and skipped rather than aborting the patch.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `res.mode` is [`BuildMode::Thin`] but `changed_files` is empty — every thin
-    /// build is triggered by at least one file change, so this should be unreachable in practice.
-    pub(crate) async fn hotpatch(
-        &mut self,
-        res: &BuildArtifacts,
-        cache: &HotpatchModuleCache,
-    ) -> Result<JumpTable> {
-        let original = self.build.main_exe();
-        let new = self.build.patch_exe(res.time_start);
+    pub(crate) fn hotpatch_binary_path(&self, res: &BuildArtifacts) -> PathBuf {
+        self.build.patch_exe(res.time_start)
+    }
+
+    pub(crate) async fn prepare_hotpatch(&mut self, res: &BuildArtifacts) -> Result<()> {
         let asset_dir = self.build.bundle_asset_dir();
 
         // Hotpatch asset!() calls
@@ -847,7 +795,7 @@ impl AppBuilder {
         }
 
         // Make sure to add `include!()` calls to the watcher so we can watch changes as they evolve
-        for file in res.depinfo.files.iter() {
+        for file in &res.depinfo.files {
             let original_artifacts = self
                 .artifacts
                 .as_mut()
@@ -858,9 +806,15 @@ impl AppBuilder {
             }
         }
 
-        tracing::debug!("Patching {} -> {}", original.display(), new.display());
+        Ok(())
+    }
 
-        let mut jump_table = self.build.create_jump_table(&new, cache)?;
+    pub(crate) async fn finish_hotpatch(
+        &mut self,
+        res: &BuildArtifacts,
+        mut jump_table: JumpTable,
+    ) -> Result<JumpTable> {
+        let new = self.hotpatch_binary_path(res);
 
         // If it's android, we need to copy the assets to the device and then change the location of the patch
         if self.build.bundle == BundleFormat::Android {
