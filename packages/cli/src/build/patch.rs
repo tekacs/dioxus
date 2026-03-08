@@ -626,6 +626,26 @@ pub fn create_wasm_jump_table(patch: &Path, cache: &HotpatchModuleCache) -> Resu
             _ => None,
         })
         .context("Missing ifunc table")?;
+
+    // Build a mapping from Rust-mangled import function names (walrus names) to their
+    // JS import names. In the base module, imports have both:
+    //   - walrus function name: `_ZN6render8electron4HOST4init43__wbg_static_accessor_HOST_82b7...E`
+    //   - import entry name:    `__wbg_static_accessor_HOST_82b74848af844c9f`
+    // The patch uses the walrus name as its env import name, but __saved_wbg_ wrappers
+    // use the import entry name. This map bridges the two.
+    let import_walrus_to_js: HashMap<&str, &str> = old
+        .imports
+        .iter()
+        .filter_map(|i| {
+            let func_id = match i.kind {
+                ImportKind::Function(f) => f,
+                _ => return None,
+            };
+            let walrus_name = old.funcs.get(func_id).name.as_deref()?;
+            Some((walrus_name, i.name.as_str()))
+        })
+        .collect();
+
     for env_func_import in env_funcs {
         let import = new.imports.get(env_func_import);
         let ImportKind::Function(func_id) = import.kind else {
@@ -649,6 +669,23 @@ pub fn create_wasm_jump_table(patch: &Path, cache: &HotpatchModuleCache) -> Resu
                 name.clone(),
             );
             continue;
+        }
+
+        // If this env import corresponds to a wasm-bindgen import in the base module,
+        // look up its __saved_wbg_ wrapper via the JS import name (not the Rust-mangled name).
+        if let Some(js_import_name) = import_walrus_to_js.get(name.as_str()) {
+            let saved_name = format!("__saved_wbg_{}", js_import_name);
+            if let Some(&table_idx) = name_to_ifunc_old.get(saved_name.as_str()) {
+                new.imports.delete(env_func_import);
+                convert_func_to_ifunc_call(
+                    &mut new,
+                    ifunc_table_initializer,
+                    func_id,
+                    table_idx,
+                    name,
+                );
+                continue;
+            }
         }
 
         if metadata.is_bindgen_symbol(&name) || name_is_bindgen_symbol(&name) {
@@ -732,8 +769,10 @@ pub fn create_wasm_jump_table(patch: &Path, cache: &HotpatchModuleCache) -> Resu
     //
     // The ifunc_count will be passed to the dynamic loader so it can allocate the right amount of space
     // in the indirect function table when loading the patch.
+    // Note: we must count ALL element segment entries (including unnamed ones), not just named ones,
+    // since the wasm element segment writes all entries into the table at instantiation time.
     let name_to_ifunc_new = collect_func_ifuncs(&new);
-    let ifunc_count = name_to_ifunc_new.len() as u64;
+    let ifunc_count = count_element_segment_entries(&new);
     let mut map = AddressMap::default();
     for (name, idx) in name_to_ifunc_new.iter() {
         // Find the corresponding ifunc in the old module by name
@@ -838,6 +877,22 @@ fn collect_func_ifuncs(m: &Module) -> HashMap<&str, i32> {
     }
 
     func_to_offset
+}
+
+/// Count the total number of entries across all active element segments in the module.
+/// This must match what the wasm runtime writes into the table at instantiation time.
+fn count_element_segment_entries(m: &Module) -> u64 {
+    let mut count = 0u64;
+    for el in m.elements.iter() {
+        if !matches!(&el.kind, ElementKind::Active { .. }) {
+            continue;
+        }
+        count += match &el.items {
+            ElementItems::Functions(ids) => ids.len() as u64,
+            ElementItems::Expressions(_, exprs) => exprs.len() as u64,
+        };
+    }
+    count
 }
 
 /// Resolve the undefined symbols in the incrementals against the original binary, returning an object
