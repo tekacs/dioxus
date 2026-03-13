@@ -2968,6 +2968,100 @@ impl BuildRequest {
         }
     }
 
+    /// Compile a workspace dependency crate directly with `rustc` using its captured args.
+    ///
+    /// This produces an updated rlib at the same path cargo originally wrote to.
+    /// Used during thin builds to recompile changed workspace deps before the tip crate.
+    async fn compile_dep_crate(&self, crate_name: &str, rustc_args: &RustcArgs) -> Result<()> {
+        let mut cmd = Command::new("rustc");
+        cmd.current_dir(self.workspace_dir());
+        cmd.env_clear();
+
+        // Skip args[0] which is the rustc binary path captured by the wrapper.
+        cmd.args(rustc_args.args[1..].iter());
+
+        // Match tip-crate thin builds for wasm/wasi so cached dep objects are link-compatible.
+        if self.is_wasm_or_wasi() {
+            cmd.arg("-Crelocation-model=pic");
+        }
+
+        // Restore the captured environment, filtering out wrapper env vars and
+        // stale cargo jobserver vars to prevent recursive invocation and warnings.
+        let filtered_env_keys = [
+            "RUSTC_WORKSPACE_WRAPPER",
+            "RUSTC_WRAPPER",
+            DX_RUSTC_WRAPPER_ENV_VAR,
+            "CARGO_MAKEFLAGS",
+            "MAKEFLAGS",
+        ];
+        cmd.envs(
+            rustc_args
+                .envs
+                .iter()
+                .filter(|(k, _)| !filtered_env_keys.contains(&k.as_str()))
+                .cloned(),
+        );
+
+        let output = cmd.output().await?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!("Failed to compile workspace dep crate '{crate_name}':\n{stderr}");
+        }
+
+        Ok(())
+    }
+
+    /// Find the rlib path for a workspace crate from its captured rustc args.
+    ///
+    /// Extracts `--out-dir` and `-C extra-filename` from the args to construct the exact
+    /// rlib filename. This matters because multiple rlibs for the same crate can coexist
+    /// in the deps directory, and globbing would return an arbitrary one.
+    fn find_rlib_for_crate(&self, crate_name: &str, rustc_args: &RustcArgs) -> Option<PathBuf> {
+        let out_dir = rustc_args
+            .args
+            .iter()
+            .zip(rustc_args.args.iter().skip(1))
+            .find(|(flag, _)| *flag == "--out-dir")
+            .map(|(_, dir)| PathBuf::from(dir))?;
+
+        let extra_filename = rustc_args.args.iter().enumerate().find_map(|(i, arg)| {
+            arg.strip_prefix("-Cextra-filename=")
+                .map(|s| s.to_string())
+                .or_else(|| {
+                    if arg == "-C" {
+                        rustc_args.args.get(i + 1).and_then(|next| {
+                            next.strip_prefix("extra-filename=").map(|s| s.to_string())
+                        })
+                    } else {
+                        None
+                    }
+                })
+        });
+
+        if let Some(extra) = &extra_filename {
+            let exact = out_dir.join(format!("lib{crate_name}{extra}.rlib"));
+            if exact.exists() {
+                return Some(exact);
+            }
+        }
+
+        let prefix = format!("lib{crate_name}-");
+        let entries = std::fs::read_dir(&out_dir).ok()?;
+        let mut best: Option<(PathBuf, std::time::SystemTime)> = None;
+        for entry in entries.flatten() {
+            if let Some(name) = entry.file_name().to_str() {
+                if name.starts_with(&prefix) && name.ends_with(".rlib") {
+                    let mtime = entry.metadata().ok()?.modified().ok()?;
+                    if best.as_ref().map_or(true, |(_, t)| mtime > *t) {
+                        best = Some((entry.path(), mtime));
+                    }
+                }
+            }
+        }
+
+        best.map(|(path, _)| path)
+    }
+
     /// Resolve the configured public directory relative to the crate, if any.
     pub(crate) fn user_public_dir(&self) -> Option<PathBuf> {
         let path = self.config.application.public_dir.as_ref()?;

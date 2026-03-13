@@ -203,6 +203,15 @@ impl WasmBindgen {
             }
 
             if self.emit_hotpatch_metadata && stderr.contains("--emit-hotpatch-metadata") {
+                if self.keep_local_functions {
+                    // Fat hotpatch builds require the metadata sidecar for correct
+                    // externref shim resolution and import rename tracking.
+                    return Err(anyhow!(
+                        "wasm-bindgen at {} does not support --emit-hotpatch-metadata, which is required for fat hotpatch builds. \
+                         Use a wasm-bindgen binary from the tekacs/wasm-bindgen fork (branch custom).",
+                        binary.display()
+                    ));
+                }
                 tracing::warn!(
                     "wasm-bindgen at {} does not support --emit-hotpatch-metadata, retrying without it",
                     binary.display()

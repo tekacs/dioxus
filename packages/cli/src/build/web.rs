@@ -97,8 +97,8 @@ impl BuildRequest {
         // Lift the internal functions to exports
         if ctx.mode == BuildMode::Fat {
             let unprocessed = std::fs::read(exe)?;
-            let all_exported_bytes = crate::build::prepare_wasm_base_module(&unprocessed)?;
-            std::fs::write(exe, all_exported_bytes)?;
+            let stubbed_bytes = crate::build::stub_wasm_env_imports(&unprocessed)?;
+            std::fs::write(exe, stubbed_bytes)?;
         }
 
         // Prepare our configuration
@@ -138,6 +138,8 @@ impl BuildRequest {
             .demangle(demangle)
             .keep_debug(keep_debug)
             .keep_lld_exports(true)
+            .emit_hotpatch_metadata(ctx.mode == BuildMode::Fat)
+            .keep_local_functions(ctx.mode == BuildMode::Fat)
             .out_name(self.executable_name())
             .out_dir(&bindgen_outdir)
             .remove_name_section(!keep_names)
@@ -146,6 +148,16 @@ impl BuildRequest {
             .await
             .context("Failed to generate wasm-bindgen bindings")?;
         tracing::debug!(dx_src = ?TraceSrc::Bundle, "wasm-bindgen complete in {:?}", start.elapsed());
+
+        if ctx.mode == BuildMode::Fat {
+            let metadata =
+                crate::build::wasm_hotpatch_metadata::WasmHotpatchMetadata::load_required_for_base_wasm(
+                    &post_bindgen_wasm,
+                )?;
+            let bindgened = std::fs::read(&post_bindgen_wasm)?;
+            let finalized = crate::build::finalize_wasm_base_module(&bindgened, &metadata)?;
+            std::fs::write(&post_bindgen_wasm, finalized)?;
+        }
 
         // Run bundle splitting if the user has requested it
         // It's pretty expensive but because of rayon should be running separate threads, hopefully

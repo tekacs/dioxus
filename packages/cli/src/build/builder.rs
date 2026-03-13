@@ -25,7 +25,7 @@ use tokio::{
 };
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
-use super::{BuildContext, BuildId, BuildMode, HotpatchModuleCache};
+use super::{BuildContext, BuildId, BuildMode};
 
 /// The component of the serve engine that watches ongoing builds and manages their state, open handle,
 /// and progress.
