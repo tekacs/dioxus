@@ -310,14 +310,43 @@ unsafe fn commit_patch(table: JumpTable) {
         Box::into_raw(Box::new(table)),
         std::sync::atomic::Ordering::Relaxed,
     );
-    HOTRELOAD_HANDLERS
-        .lock()
-        .unwrap()
-        .clone()
-        .iter()
-        .for_each(|handler| {
+
+    let handlers = HOTRELOAD_HANDLERS.lock().unwrap().clone();
+
+    // On wasm32, commit_patch is called from within a spawn_local async task.
+    // QueueState::run_all holds a RefCell borrow on the task queue, so calling
+    // spawn_local (or anything that touches the queue) from a handler would panic
+    // with "RefCell already borrowed". Use queueMicrotask to defer handler calls
+    // until after run_all releases its borrow.
+    #[cfg(target_arch = "wasm32")]
+    {
+        use wasm_bindgen::prelude::*;
+        let queue_microtask = js_sys::Reflect::get(
+            &js_sys::global(),
+            &wasm_bindgen::JsValue::from_str("queueMicrotask"),
+        )
+        .ok()
+        .and_then(|v| v.dyn_into::<js_sys::Function>().ok());
+
+        for handler in handlers {
+            let cb = Closure::once_into_js(move || handler());
+            if let Some(ref qmt) = queue_microtask {
+                let _ = qmt.call1(&wasm_bindgen::JsValue::undefined(), &cb);
+            } else {
+                // Fallback: just call directly (may panic if re-entrant, but
+                // queueMicrotask is available in all modern browsers/runtimes)
+                let f: js_sys::Function = cb.unchecked_into();
+                let _ = f.call0(&wasm_bindgen::JsValue::undefined());
+            }
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        for handler in handlers {
             handler();
-        });
+        }
+    }
 }
 
 /// A panic issued by the [`call`] function if the caller would be stale if called. This causes
