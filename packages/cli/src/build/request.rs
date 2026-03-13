@@ -6011,6 +6011,11 @@ __wbg_init({{module_or_path: "/{}/{wasm_path}"}}).then((wasm) => {{
     /// target arg guarantees this will work.
     fn bust_fingerprint(&self, ctx: &BuildContext) -> Result<()> {
         if matches!(ctx.mode, BuildMode::Fat) {
+            // Clear stale captured rustc args so every entry comes from this build.
+            let args_dir = self.rustc_wrapper_args_dir();
+            let _ = std::fs::remove_dir_all(&args_dir);
+            let _ = std::fs::create_dir_all(&args_dir);
+
             let fingerprint_dir = self
                 .target_dir
                 .join(self.triple.to_string())
