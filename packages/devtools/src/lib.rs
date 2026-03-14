@@ -45,6 +45,12 @@ pub fn try_apply_changes(dom: &VirtualDom, msg: &HotReloadMsg) -> Result<(), Pat
 
             if msg.for_pid == our_pid {
                 unsafe { subsecond::apply_patch(jump_table) }?;
+                // On wasm, apply_patch spawns the work via spawn_local and returns
+                // immediately. The subsecond handler will send AllDirty via
+                // queueMicrotask once the patch is committed. Calling force_all_dirty()
+                // synchronously here would re-enter the wasm-bindgen-futures task
+                // executor and panic with "RefCell already borrowed".
+                #[cfg(not(target_arch = "wasm32"))]
                 dom.runtime().force_all_dirty();
                 ctx.clear::<Signal<Option<HotReloadedTemplate>>>();
             }
