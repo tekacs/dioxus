@@ -8,6 +8,7 @@ const SAVED_WBG_PREFIX: &str = "__saved_wbg_";
 pub(crate) struct WasmHotpatchMetadata {
     bindgen_symbol_set: HashSet<String>,
     cast_mappings: HashMap<String, Vec<String>>,
+    cast_generated_imports_by_old_name: HashMap<String, String>,
     placeholder_import_names: HashSet<String>,
     pub(crate) externref_shim_map: HashMap<String, String>,
     /// Maps original import names to their final (renamed) names in the post-bindgen module.
@@ -87,16 +88,16 @@ impl WasmHotpatchMetadata {
         };
 
         let bindgen_symbol_set = raw.bindgen_symbol_set.into_iter().collect::<HashSet<_>>();
-        let cast_mappings = raw
-            .cast_mappings
-            .into_iter()
-            .map(|mapping| {
-                (
-                    mapping.generated_import_name,
-                    mapping.original_function_names,
-                )
-            })
-            .collect::<HashMap<_, _>>();
+        let mut cast_mappings = HashMap::new();
+        let mut cast_generated_imports_by_old_name = HashMap::new();
+        for mapping in raw.cast_mappings {
+            let generated_import_name = mapping.generated_import_name;
+            for old_name in &mapping.original_function_names {
+                cast_generated_imports_by_old_name
+                    .insert(old_name.clone(), generated_import_name.clone());
+            }
+            cast_mappings.insert(generated_import_name, mapping.original_function_names);
+        }
         let placeholder_import_names = raw
             .placeholder_import_mappings
             .into_iter()
@@ -118,6 +119,7 @@ impl WasmHotpatchMetadata {
         Self {
             bindgen_symbol_set,
             cast_mappings,
+            cast_generated_imports_by_old_name,
             placeholder_import_names,
             externref_shim_map,
             import_renames,
@@ -157,5 +159,45 @@ impl WasmHotpatchMetadata {
         old_names
             .iter()
             .find_map(|old_name| name_to_ifunc_old.get(old_name).copied())
+    }
+
+    pub(crate) fn cast_generated_import_name_for_function<'a>(
+        &'a self,
+        function_name: &str,
+    ) -> Option<&'a str> {
+        self.cast_generated_imports_by_old_name
+            .get(function_name)
+            .map(|name| name.as_str())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolves_generated_cast_imports_from_original_function_names() {
+        let old_name = "_ZN12wasm_bindgen4__rt8wbg_cast17breaks_if_inlined17h89ebd8cfd0f04703E";
+        let generated_name = "__wbindgen_cast_000000000000000e";
+
+        let metadata = WasmHotpatchMetadata {
+            bindgen_symbol_set: HashSet::new(),
+            cast_mappings: HashMap::from([(
+                generated_name.to_string(),
+                vec![old_name.to_string()],
+            )]),
+            cast_generated_imports_by_old_name: HashMap::from([(
+                old_name.to_string(),
+                generated_name.to_string(),
+            )]),
+            placeholder_import_names: HashSet::new(),
+            externref_shim_map: HashMap::new(),
+            import_renames: HashMap::new(),
+        };
+
+        assert_eq!(
+            metadata.cast_generated_import_name_for_function(old_name),
+            Some(generated_name)
+        );
     }
 }

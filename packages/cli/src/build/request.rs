@@ -5166,7 +5166,10 @@ impl BuildRequest {
         // This runs post-bindgen after wasm-bindgen has already cleaned up its own dead imports
         // and adapter machinery, while fat mode's `--keep-local-functions` keeps local Rust code alive.
         if ctx.mode == BuildMode::Fat {
-            let metadata = crate::build::wasm_hotpatch_metadata::WasmHotpatchMetadata::load_for_base_wasm(&post_bindgen_wasm);
+            let metadata =
+                crate::build::wasm_hotpatch_metadata::WasmHotpatchMetadata::load_for_base_wasm(
+                    &post_bindgen_wasm,
+                );
             let bindgened = std::fs::read(&post_bindgen_wasm)?;
             let finalized = crate::build::finalize_wasm_base_module(&bindgened, &metadata)?;
             std::fs::write(&post_bindgen_wasm, finalized)?;

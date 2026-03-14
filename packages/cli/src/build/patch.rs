@@ -238,7 +238,10 @@ impl HotpatchModuleCache {
                 // the post-pass (like __saved_wbg_ wrappers) aren't in the linking section, so
                 // merge them back from the raw element segment scan.
                 let raw_ifuncs = collect_func_ifuncs(&module);
-                let saved_wbg_count = raw_ifuncs.keys().filter(|k| k.starts_with("__saved_wbg_")).count();
+                let saved_wbg_count = raw_ifuncs
+                    .keys()
+                    .filter(|k| k.starts_with("__saved_wbg_"))
+                    .count();
                 tracing::info!(
                     dx_src = ?crate::TraceSrc::Dev,
                     "[hotpatch cache] raw ifuncs: {}, symbol-resolved: {}, __saved_wbg_ in raw: {}",
@@ -691,6 +694,38 @@ pub fn create_wasm_jump_table(patch: &Path, cache: &HotpatchModuleCache) -> Resu
             continue;
         }
 
+        if let Some(cast_import_name) = metadata.cast_generated_import_name_for_function(&name) {
+            let saved_name = format!("__saved_wbg_{cast_import_name}");
+            if let Some(&table_idx) = name_to_ifunc_old
+                .get(saved_name.as_str())
+                .or_else(|| name_to_ifunc_old.get(cast_import_name))
+            {
+                tracing::info!(
+                    dx_src = ?crate::TraceSrc::Dev,
+                    "[hotpatch] env cast stub '{}' -> '{}' -> ifunc idx {}",
+                    name,
+                    saved_name,
+                    table_idx
+                );
+                new.imports.delete(env_func_import);
+                convert_func_to_ifunc_call(
+                    &mut new,
+                    ifunc_table_initializer,
+                    func_id,
+                    table_idx,
+                    name,
+                );
+                continue;
+            }
+
+            tracing::info!(
+                dx_src = ?crate::TraceSrc::Dev,
+                "[hotpatch] env cast stub '{}' mapped to '{}' but NOT in ifunc table",
+                name,
+                saved_name
+            );
+        }
+
         // If this env import corresponds to a wasm-bindgen import in the base module,
         // look up its __saved_wbg_ wrapper via the JS import name (not the Rust-mangled name).
         if let Some(js_import_name) = import_walrus_to_js.get(name.as_str()) {
@@ -725,7 +760,12 @@ pub fn create_wasm_jump_table(patch: &Path, cache: &HotpatchModuleCache) -> Resu
             );
         }
 
-        if metadata.is_bindgen_symbol(&name) || name_is_bindgen_symbol(&name) {
+        // Don't nullify wbg_cast/breaks_if_inlined — these are handled by the
+        // wbg_cast rewrite loop below. Nullifying them here would replace
+        // their body with call_indirect(0) before that loop gets a chance.
+        if !name.contains("wasm_bindgen4__rt8wbg_cast")
+            && (metadata.is_bindgen_symbol(&name) || name_is_bindgen_symbol(&name))
+        {
             new.imports.delete(env_func_import);
             convert_func_to_ifunc_call(&mut new, ifunc_table_initializer, func_id, 0, name);
             continue;
@@ -757,7 +797,10 @@ pub fn create_wasm_jump_table(patch: &Path, cache: &HotpatchModuleCache) -> Resu
             || metadata.has_placeholder_import(&original_name)
             || metadata.has_placeholder_import(&import.name);
 
-        if metadata_matches || name_is_bindgen_symbol(&import.name) || name_is_bindgen_symbol(&original_name) {
+        if metadata_matches
+            || name_is_bindgen_symbol(&import.name)
+            || name_is_bindgen_symbol(&original_name)
+        {
             let saved_final = import.name.as_str().to_string();
             // The ifunc table has entries under walrus function names, not __saved_wbg_ names.
             // For import wrappers: the wrapper IS named __saved_wbg_* (created by post-pass import loop).
@@ -775,11 +818,15 @@ pub fn create_wasm_jump_table(patch: &Path, cache: &HotpatchModuleCache) -> Resu
                 // Try the externref shim name — if the _unused import was GC'd, only
                 // the shim survives and it's what the post-pass promoted to the table.
                 .or_else(|| {
-                    metadata.externref_shim_map.get(&original_name)
+                    metadata
+                        .externref_shim_map
+                        .get(&original_name)
                         .and_then(|shim| name_to_ifunc_old.get(shim).copied())
                 })
                 .or_else(|| {
-                    metadata.externref_shim_map.get(final_name)
+                    metadata
+                        .externref_shim_map
+                        .get(final_name)
                         .and_then(|shim| name_to_ifunc_old.get(shim).copied())
                 })
                 .or_else(|| metadata.cast_target_ifunc_index(&saved_final, name_to_ifunc_old))
@@ -792,7 +839,13 @@ pub fn create_wasm_jump_table(patch: &Path, cache: &HotpatchModuleCache) -> Resu
                 );
             }
             new.imports.delete(import_id);
-            convert_func_to_ifunc_call(&mut new, ifunc_table_initializer, func_id, table_idx, saved_final);
+            convert_func_to_ifunc_call(
+                &mut new,
+                ifunc_table_initializer,
+                func_id,
+                table_idx,
+                saved_final,
+            );
         }
     }
 
@@ -812,32 +865,17 @@ pub fn create_wasm_jump_table(patch: &Path, cache: &HotpatchModuleCache) -> Resu
             continue;
         };
 
-        if name.contains("wasm_bindgen4__rt8wbg_cast") {
-            if name.contains("breaks_if_inline") {
-                // `breaks_if_inlined` is wasm-bindgen's identity stub — it takes one arg
-                // and returns it. wasm-bindgen replaces it during post-processing, but
-                // patches don't go through wasm-bindgen. Rewrite it as a no-op identity
-                // function so it doesn't call dead describe imports.
-                let func = new.funcs.get(func_id);
-                let ty = new.types.get(func.ty());
-                let params = ty.params().to_vec();
-                let results = ty.results().to_vec();
-                let mut builder = FunctionBuilder::new(&mut new.types, &params, &results);
-                let mut body = builder.name(name.to_string()).func_body();
-                let locals: Vec<_> = params.iter().map(|ty| new.locals.add(*ty)).collect();
-                for l in &locals {
-                    body.local_get(*l);
-                }
-                new.funcs.get_mut(func_id).kind = FunctionKind::Local(builder.local_func(locals));
-            } else {
-                let name = name.to_string();
-                let old_idx = name_to_ifunc_old
-                        .get(&name)
-                        .copied()
-                        .ok_or_else(|| anyhow::anyhow!("Could not find matching wbg_cast function for [{name}] - must generate new JS bindings."))?;
+        if name.contains("wasm_bindgen4__rt8wbg_cast") && !name.contains("breaks_if_inline") {
+            let name = name.to_string();
+            let old_idx = name_to_ifunc_old.get(&name).copied().unwrap_or_else(|| {
+                tracing::debug!(
+                    "[hotpatch] wbg_cast '{}' not found in base ifunc table, routing to idx 0",
+                    name
+                );
+                0
+            });
 
-                convert_func_to_ifunc_call(&mut new, ifunc_table_initializer, func_id, old_idx, name);
-            }
+            convert_func_to_ifunc_call(&mut new, ifunc_table_initializer, func_id, old_idx, name);
         }
     }
 
