@@ -1472,7 +1472,7 @@ impl BuildRequest {
             };
 
             tracing::debug!("Compiling workspace dep crate: {crate_name}");
-            self.compile_dep_crate(&crate_name, rustc_args)
+            self.compile_dep_crate(&ctx.mode, &crate_name, rustc_args)
                 .await
                 .with_context(|| format!("Failed to compile workspace dep crate '{crate_name}'"))?;
 
@@ -1503,7 +1503,7 @@ impl BuildRequest {
                 .and_then(|m| m.modified().ok());
 
             tracing::info!("Compiling tip lib target: {lib_key}");
-            if let Err(e) = self.compile_dep_crate(&tip_name, lib_args).await {
+            if let Err(e) = self.compile_dep_crate(&ctx.mode, &tip_name, lib_args).await {
                 tracing::warn!("Failed to compile tip lib target: {e}");
             } else if let Some(rlib_path) = self.find_rlib_for_crate(&tip_name, lib_args) {
                 let post_modified = std::fs::metadata(&rlib_path)
@@ -3307,28 +3307,7 @@ impl BuildRequest {
                 let rustc_args = workspace_rustc_args
                     .get(&format!("{}.bin", self.tip_crate_name()))
                     .context("Missing rustc args for tip crate")?;
-
-                let mut cmd = Command::new("rustc");
-                cmd.current_dir(self.workspace_dir());
-                cmd.env_clear();
-                cmd.args(rustc_args.args[1..].iter());
-                cmd.env_remove("RUSTC_WORKSPACE_WRAPPER");
-                cmd.env_remove("RUSTC_WRAPPER");
-                cmd.env_remove(DX_RUSTC_WRAPPER_ENV_VAR);
-                cmd.envs(
-                    self.cargo_build_env_vars(build_mode)?
-                        .iter()
-                        .map(|(k, v)| (k.as_ref(), v)),
-                );
-                cmd.arg(format!("-Clinker={}", Workspace::path_to_dx()?.display()));
-
-                if self.is_wasm_or_wasi() {
-                    cmd.arg("-Crelocation-model=pic");
-                }
-
-                cmd.envs(rustc_args.envs.iter().cloned());
-
-                Ok(cmd)
+                self.replayed_rustc_command(build_mode, rustc_args, true)
             }
 
             // For Base and Fat builds, we use a regular cargo setup, but we intercept rustc for
@@ -3381,6 +3360,44 @@ impl BuildRequest {
                 Ok(cmd)
             }
         }
+    }
+
+    fn replayed_rustc_command(
+        &self,
+        build_mode: &BuildMode,
+        rustc_args: &RustcArgs,
+        use_dx_linker: bool,
+    ) -> Result<Command> {
+        let mut cmd = Command::from(rustc_args.replay());
+        if rustc_args.cwd.as_os_str().is_empty() {
+            cmd.current_dir(self.workspace_dir());
+        }
+
+        for key in [
+            "RUSTC_WORKSPACE_WRAPPER",
+            "RUSTC_WRAPPER",
+            DX_RUSTC_WRAPPER_ENV_VAR,
+            "CARGO_MAKEFLAGS",
+            "MAKEFLAGS",
+        ] {
+            cmd.env_remove(key);
+        }
+
+        cmd.envs(
+            self.cargo_build_env_vars(build_mode)?
+                .iter()
+                .map(|(k, v)| (k.as_ref(), v)),
+        );
+
+        if use_dx_linker {
+            cmd.arg(format!("-Clinker={}", Workspace::path_to_dx()?.display()));
+        }
+
+        if self.is_wasm_or_wasi() {
+            cmd.arg("-Crelocation-model=pic");
+        }
+
+        Ok(cmd)
     }
 
     /// Create a list of arguments for cargo builds
@@ -5897,36 +5914,13 @@ __wbg_init({{module_or_path: "/{}/{wasm_path}"}}).then((wasm) => {{
     ///
     /// This produces an updated rlib at the same path cargo originally wrote to.
     /// Used during thin builds to recompile changed workspace deps before the tip crate.
-    async fn compile_dep_crate(&self, crate_name: &str, rustc_args: &RustcArgs) -> Result<()> {
-        let mut cmd = Command::new("rustc");
-        cmd.current_dir(self.workspace_dir());
-        cmd.env_clear();
-
-        // Skip args[0] which is the rustc binary path captured by the wrapper
-        cmd.args(rustc_args.args[1..].iter());
-
-        // Match tip-crate thin builds for wasm/wasi so cached dep objects are link-compatible.
-        if self.is_wasm_or_wasi() {
-            cmd.arg("-Crelocation-model=pic");
-        }
-
-        // Restore the captured environment, filtering out wrapper env vars and
-        // stale cargo jobserver vars to prevent recursive invocation and warnings.
-        let filtered_env_keys = [
-            "RUSTC_WORKSPACE_WRAPPER",
-            "RUSTC_WRAPPER",
-            DX_RUSTC_WRAPPER_ENV_VAR,
-            "CARGO_MAKEFLAGS",
-            "MAKEFLAGS",
-        ];
-        cmd.envs(
-            rustc_args
-                .envs
-                .iter()
-                .filter(|(k, _)| !filtered_env_keys.contains(&k.as_str()))
-                .cloned(),
-        );
-
+    async fn compile_dep_crate(
+        &self,
+        build_mode: &BuildMode,
+        crate_name: &str,
+        rustc_args: &RustcArgs,
+    ) -> Result<()> {
+        let mut cmd = self.replayed_rustc_command(build_mode, rustc_args, false)?;
         let output = cmd.output().await?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);

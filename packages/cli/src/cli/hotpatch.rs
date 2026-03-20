@@ -77,6 +77,7 @@ impl HotpatchTip {
             crate::RustcArgs {
                 args: rustc_args,
                 envs: rustc_envs,
+                cwd: request.crate_dir(),
                 link_args,
             },
         );

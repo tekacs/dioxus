@@ -27,8 +27,24 @@ pub fn is_wrapping_rustc() -> bool {
 pub struct RustcArgs {
     pub args: Vec<String>,
     pub envs: Vec<(String, String)>,
+    #[serde(default)]
+    pub cwd: PathBuf,
     /// it doesn't include first program name argument
     pub link_args: Vec<String>,
+}
+
+impl RustcArgs {
+    pub fn replay(&self) -> std::process::Command {
+        let rustc = self.args.first().map(String::as_str).unwrap_or("rustc");
+        let mut cmd = std::process::Command::new(rustc);
+        cmd.args(self.args.iter().skip(1));
+        cmd.env_clear();
+        cmd.envs(self.envs.iter().cloned());
+        if !self.cwd.as_os_str().is_empty() {
+            cmd.current_dir(&self.cwd);
+        }
+        cmd
+    }
 }
 
 /// Check if the arguments indicate a linking step, including those in command files.
@@ -87,6 +103,7 @@ pub fn run_rustc() -> ExitCode {
     let rustc_args = RustcArgs {
         args: captured_args.clone(),
         envs: vars().collect::<_>(),
+        cwd: std::env::current_dir().expect("Failed to get current dir"),
         link_args: Default::default(),
     };
 
@@ -132,17 +149,54 @@ pub fn run_rustc() -> ExitCode {
 
     // Run the actual rustc command.
     // We want all stdout/stderr to be inherited, so the user sees the compiler output.
-    let mut cmd = std::process::Command::new("rustc");
-
-    // The first argument in `captured_args` is the rustc path, which we need to skip
-    // when passing arguments to the `rustc` command we are spawning.
-    cmd.args(captured_args.iter().skip(1));
-    cmd.envs(rustc_args.envs);
+    let mut cmd = rustc_args.replay();
     cmd.stdout(std::process::Stdio::inherit());
     cmd.stderr(std::process::Stdio::inherit());
-    cmd.current_dir(std::env::current_dir().expect("Failed to get current dir"));
 
     // Spawn the process and propagate its exit code.
     let status = cmd.status().expect("Failed to execute rustc command");
     std::process::exit(status.code().unwrap_or(1)); // Exit with 1 if process was killed by signal
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RustcArgs;
+    use std::path::PathBuf;
+
+    #[test]
+    fn replay_restores_program_args_env_and_cwd() {
+        let rustc_args = RustcArgs {
+            args: vec![
+                "/toolchain/bin/rustc".into(),
+                "--crate-name".into(),
+                "example".into(),
+            ],
+            envs: vec![("FOO".into(), "BAR".into())],
+            cwd: PathBuf::from("/tmp/example"),
+            link_args: vec![],
+        };
+
+        let cmd = rustc_args.replay();
+
+        assert_eq!(cmd.get_program(), "/toolchain/bin/rustc");
+        assert_eq!(
+            cmd.get_args()
+                .map(|arg| arg.to_string_lossy())
+                .collect::<Vec<_>>(),
+            vec!["--crate-name", "example"]
+        );
+        assert_eq!(
+            cmd.get_envs()
+                .map(|(key, val)| (
+                    key.to_string_lossy().into_owned(),
+                    val.map(|val| val.to_string_lossy().into_owned())
+                ))
+                .collect::<Vec<_>>(),
+            vec![("FOO".to_string(), Some("BAR".to_string()))]
+        );
+        assert_eq!(
+            cmd.get_current_dir(),
+            Some(PathBuf::from("/tmp/example").as_path())
+        );
+    }
 }
