@@ -27,7 +27,24 @@ impl WorkspaceRustcArgs {
 pub struct RustcArgs {
     pub args: Vec<String>,
     pub envs: Vec<(String, String)>,
+    #[serde(default)]
     pub cwd: PathBuf,
+    /// it doesn't include first program name argument
+    pub link_args: Vec<String>,
+}
+
+impl RustcArgs {
+    pub fn replay(&self) -> std::process::Command {
+        let rustc = self.args.first().map(String::as_str).unwrap_or("rustc");
+        let mut cmd = std::process::Command::new(rustc);
+        cmd.args(self.args.iter().skip(1));
+        cmd.env_clear();
+        cmd.envs(self.envs.iter().cloned());
+        if !self.cwd.as_os_str().is_empty() {
+            cmd.current_dir(&self.cwd);
+        }
+        cmd
+    }
 }
 
 /// The environment variable indicating where the args directory is located.
@@ -48,6 +65,36 @@ pub fn is_wrapping_rustc() -> bool {
     std::env::var(DX_RUSTC_WRAPPER_ENV_VAR).is_ok()
 }
 
+/// Check if the arguments indicate a linking step, including those in command files.
+fn has_linking_args() -> bool {
+    for arg in std::env::args() {
+        if arg.ends_with(".o") || arg == "-flavor" {
+            return true;
+        }
+
+        if let Some(path_str) = arg.strip_prefix('@') {
+            if let Ok(file_binary) = std::fs::read(path_str) {
+                let content = String::from_utf8(file_binary.clone()).unwrap_or_else(|_| {
+                    let binary_u16le: Vec<u16> = file_binary
+                        .chunks_exact(2)
+                        .map(|a| u16::from_le_bytes([a[0], a[1]]))
+                        .collect();
+                    String::from_utf16_lossy(&binary_u16le)
+                });
+
+                if content.lines().any(|line| {
+                    let trimmed_line = line.trim().trim_matches('"');
+                    trimmed_line.ends_with(".o") || trimmed_line == "-flavor"
+                }) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
 /// Run rustc directly, but output the result to a per-crate file in the args directory.
 ///
 /// <https://doc.rust-lang.org/cargo/reference/config.html#buildrustc>
@@ -56,14 +103,15 @@ pub fn run_rustc() -> ExitCode {
         .expect("DX_RUSTC env var must be set")
         .into();
 
-    // Cargo invokes a workspace wrapper like: `wrapper-name rustc [args...]`
+    // Cargo invokes a workspace wrapper like: `wrapper-name rustc [args...]`.
     // We skip our own executable name (`wrapper-name`) to get the args passed to us.
     let captured_args = args().skip(1).collect::<Vec<_>>();
 
     let rustc_args = RustcArgs {
-        args: captured_args.clone(),
+        args: captured_args,
         envs: vars().collect::<_>(),
         cwd: std::env::current_dir().expect("Failed to get current dir"),
+        link_args: Default::default(),
     };
 
     // Always persist the captured rustc invocation, even for link steps.
@@ -80,24 +128,15 @@ pub fn run_rustc() -> ExitCode {
 
     // Run the actual rustc command.
     // We want all stdout/stderr to be inherited, so the user sees the compiler output.
-    let mut cmd = std::process::Command::new("rustc");
-
-    // The first argument in `captured_args` is the rustc path, which we need to skip
-    // when passing arguments to the `rustc` command we are spawning.
-    cmd.args(captured_args.iter().skip(1));
-    cmd.envs(rustc_args.envs);
-    cmd.current_dir(rustc_args.cwd);
+    let mut cmd = rustc_args.replay();
     cmd.stdout(std::process::Stdio::inherit());
     cmd.stderr(std::process::Stdio::inherit());
 
-    // Spawn the process and propagate its exit code.
     let status = cmd.status().expect("Failed to execute rustc command");
-    std::process::exit(status.code().unwrap_or(1)); // Exit with 1 if process was killed by signal
+    std::process::exit(status.code().unwrap_or(1));
 }
 
 fn write_rustc_args(args_dir: &PathBuf, rustc_args: &RustcArgs) {
-    // Extract the crate name from the args to use as the filename.
-    // Skip non-sensical args when a build is completely fresh (rustc is invoked with --crate-name ___)
     let crate_name = rustc_args
         .args
         .iter()
@@ -119,13 +158,10 @@ fn write_rustc_args(args_dir: &PathBuf, rustc_args: &RustcArgs) {
             let serialized_args =
                 serde_json::to_string(rustc_args).expect("Failed to serialize rustc args");
 
-            // Write args with an explicit target suffix: {crate_name}.lib.json or
-            // {crate_name}.bin.json. This avoids the ambiguity of a bare {crate_name}.json
-            // and ensures lib+bin crates don't overwrite each other.
             let suffix = match crate_type {
                 Some("lib" | "rlib") => "lib",
                 Some("bin") => "bin",
-                _ => "bin", // proc-macro, cdylib, etc. — treat as bin
+                _ => "bin",
             };
 
             std::fs::write(
@@ -137,36 +173,45 @@ fn write_rustc_args(args_dir: &PathBuf, rustc_args: &RustcArgs) {
     }
 }
 
-/// Check if the arguments indicate a linking step, including those in command files.
-fn has_linking_args() -> bool {
-    for arg in std::env::args() {
-        // Direct check for linker-like arguments
-        if arg.ends_with(".o") || arg == "-flavor" {
-            return true;
-        }
+#[cfg(test)]
+mod tests {
+    use super::RustcArgs;
+    use std::path::PathBuf;
 
-        // Check inside command files
-        if let Some(path_str) = arg.strip_prefix('@') {
-            if let Ok(file_binary) = std::fs::read(path_str) {
-                // Handle both UTF-8 and UTF-16LE encodings for response files.
-                let content = String::from_utf8(file_binary.clone()).unwrap_or_else(|_| {
-                    let binary_u16le: Vec<u16> = file_binary
-                        .chunks_exact(2)
-                        .map(|a| u16::from_le_bytes([a[0], a[1]]))
-                        .collect();
-                    String::from_utf16_lossy(&binary_u16le)
-                });
+    #[test]
+    fn replay_restores_program_args_env_and_cwd() {
+        let rustc_args = RustcArgs {
+            args: vec![
+                "/toolchain/bin/rustc".into(),
+                "--crate-name".into(),
+                "example".into(),
+            ],
+            envs: vec![("FOO".into(), "BAR".into())],
+            cwd: PathBuf::from("/tmp/example"),
+            link_args: vec![],
+        };
 
-                // Check if any line in the command file contains linking indicators.
-                if content.lines().any(|line| {
-                    let trimmed_line = line.trim().trim_matches('"');
-                    trimmed_line.ends_with(".o") || trimmed_line == "-flavor"
-                }) {
-                    return true;
-                }
-            }
-        }
+        let cmd = rustc_args.replay();
+
+        assert_eq!(cmd.get_program(), "/toolchain/bin/rustc");
+        assert_eq!(
+            cmd.get_args()
+                .map(|arg| arg.to_string_lossy())
+                .collect::<Vec<_>>(),
+            vec!["--crate-name", "example"]
+        );
+        assert_eq!(
+            cmd.get_envs()
+                .map(|(key, val)| (
+                    key.to_string_lossy().into_owned(),
+                    val.map(|val| val.to_string_lossy().into_owned())
+                ))
+                .collect::<Vec<_>>(),
+            vec![("FOO".to_string(), Some("BAR".to_string()))]
+        );
+        assert_eq!(
+            cmd.get_current_dir(),
+            Some(PathBuf::from("/tmp/example").as_path())
+        );
     }
-
-    false
 }
