@@ -1447,25 +1447,13 @@ impl BuildRequest {
         let tip_name = self.tip_crate_name();
         let mut object_cache = object_cache.clone();
 
-        // Compile workspace dep crates with cascade. Start with the explicitly changed dep
-        // crates (already in leaf-first order from handle_file_change). As we compile each,
-        // add the crate's workspace dependents so their rlibs have consistent SVH references.
-        let mut crates_to_compile: Vec<String> = changed_crates
-            .iter()
-            .filter(|c| *c != &tip_name)
-            .cloned()
-            .collect();
-        let mut compiled = HashSet::new();
-        let mut idx = 0;
-
-        while idx < crates_to_compile.len() {
-            let crate_name = crates_to_compile[idx].clone();
-            idx += 1;
-
-            if !compiled.insert(crate_name.clone()) || crate_name == tip_name {
-                continue;
-            }
-
+        // Compile workspace dep crates with cascade in topological order.
+        //
+        // We need to respect dependencies within the changed workspace subset itself. For example,
+        // if `interfacing` depends on `infinity` and both depend on `mori`, replaying them in the
+        // arbitrary order returned by `direct_dependents()` can trigger E0460 mismatches.
+        let crates_to_compile = self.workspace_compile_order(changed_crates, &tip_name);
+        for crate_name in crates_to_compile {
             let Some(rustc_args) = workspace_rustc_args.get(&format!("{crate_name}.lib")) else {
                 tracing::warn!("No captured rustc args for workspace crate {crate_name}, skipping");
                 continue;
@@ -1479,15 +1467,6 @@ impl BuildRequest {
             if let Some(rlib_path) = self.find_rlib_for_crate(&crate_name, rustc_args) {
                 if let Err(e) = object_cache.cache_from_rlib(&crate_name, &rlib_path) {
                     tracing::warn!("Failed to cache objects from rlib for {crate_name}: {e}");
-                }
-            }
-
-            for dependent in self.workspace_dependents_of(&crate_name) {
-                if dependent != tip_name && !compiled.contains(&dependent) {
-                    tracing::debug!(
-                        "Cascade: recompiling {dependent} (depends on recompiled {crate_name})"
-                    );
-                    crates_to_compile.push(dependent);
                 }
             }
         }
@@ -5908,6 +5887,119 @@ __wbg_init({{module_or_path: "/{}/{wasm_path}"}}).then((wasm) => {{
                 }
             })
             .collect()
+    }
+
+    fn workspace_dependencies_of(&self, crate_name: &str) -> Vec<String> {
+        let krates = &self.workspace.krates;
+
+        let Some(target_node) = krates.workspace_members().find_map(|member| {
+            if let krates::Node::Krate { id, krate, .. } = member {
+                if krate.name.replace('-', "_") == crate_name {
+                    return krates.nid_for_kid(id);
+                }
+            }
+            None
+        }) else {
+            return Vec::new();
+        };
+
+        let workspace_names: HashSet<String> = krates
+            .workspace_members()
+            .filter_map(|member| {
+                if let krates::Node::Krate { krate, .. } = member {
+                    Some(krate.name.replace('-', "_"))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        krates
+            .get_deps(target_node)
+            .filter_map(|(dep, _)| {
+                let krates::Node::Krate { krate, .. } = dep else {
+                    return None;
+                };
+                let name = krate.name.replace('-', "_");
+                workspace_names.contains(&name).then_some(name)
+            })
+            .collect()
+    }
+
+    fn workspace_compile_order(&self, changed_crates: &[String], tip_name: &str) -> Vec<String> {
+        let mut closure = HashSet::new();
+        let mut to_visit: Vec<String> = changed_crates
+            .iter()
+            .filter(|crate_name| crate_name.as_str() != tip_name)
+            .cloned()
+            .collect();
+
+        while let Some(crate_name) = to_visit.pop() {
+            if !closure.insert(crate_name.clone()) {
+                continue;
+            }
+
+            for dependent in self.workspace_dependents_of(&crate_name) {
+                if dependent != tip_name {
+                    to_visit.push(dependent);
+                }
+            }
+        }
+
+        let mut ordered = Vec::new();
+        let mut visiting = HashSet::new();
+        let mut visited = HashSet::new();
+
+        let mut roots = closure.iter().cloned().collect::<Vec<_>>();
+        roots.sort();
+        for crate_name in roots {
+            self.visit_workspace_compile_order(
+                &crate_name,
+                &closure,
+                &mut visiting,
+                &mut visited,
+                &mut ordered,
+            );
+        }
+
+        tracing::debug!("Workspace compile order: {:?}", ordered);
+        ordered
+    }
+
+    fn visit_workspace_compile_order(
+        &self,
+        crate_name: &str,
+        closure: &HashSet<String>,
+        visiting: &mut HashSet<String>,
+        visited: &mut HashSet<String>,
+        ordered: &mut Vec<String>,
+    ) {
+        if visited.contains(crate_name) || !closure.contains(crate_name) {
+            return;
+        }
+
+        if !visiting.insert(crate_name.to_string()) {
+            tracing::warn!(
+                "Cycle detected while ordering workspace hotpatch crates at {crate_name}"
+            );
+            return;
+        }
+
+        let mut deps = self
+            .workspace_dependencies_of(crate_name)
+            .into_iter()
+            .filter(|dep| closure.contains(dep))
+            .collect::<Vec<_>>();
+        deps.sort();
+
+        for dependency in deps {
+            self.visit_workspace_compile_order(&dependency, closure, visiting, visited, ordered);
+        }
+
+        visiting.remove(crate_name);
+        if visited.insert(crate_name.to_string()) {
+            ordered.push(crate_name.to_string());
+        }
     }
 
     /// Compile a workspace dependency crate directly with `rustc` using its captured args.
