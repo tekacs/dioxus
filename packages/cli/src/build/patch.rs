@@ -18,7 +18,7 @@ use target_lexicon::{Architecture, OperatingSystem, PointerWidth, Triple};
 use thiserror::Error;
 use walrus::{
     ConstExpr, DataKind, ElementItems, ElementKind, FunctionBuilder, FunctionId, FunctionKind,
-    ImportKind, Module, RefType, TableId,
+    ImportKind, Module, RefType, TableId, ValType,
 };
 use wasmparser::{
     BinaryReader, BinaryReaderError, Linking, LinkingSectionReader, Payload, SymbolInfo,
@@ -70,6 +70,7 @@ pub struct HotpatchModuleCache {
 
     // .... wasm stuff
     pub symbol_ifunc_map: HashMap<String, i32>,
+    pub symbol_ifunc_types: HashMap<String, (Vec<ValType>, Vec<ValType>)>,
     pub old_wasm: Module,
     pub old_bytes: Vec<u8>,
     pub old_exports: HashSet<String>,
@@ -238,6 +239,7 @@ impl HotpatchModuleCache {
                 // the post-pass (like __saved_wbg_ wrappers) aren't in the linking section, so
                 // merge them back from the raw element segment scan.
                 let raw_ifuncs = collect_func_ifuncs(&module);
+                let raw_ifunc_types = collect_func_ifunc_types(&module);
                 let saved_wbg_count = raw_ifuncs
                     .keys()
                     .filter(|k| k.starts_with("__saved_wbg_"))
@@ -249,6 +251,18 @@ impl HotpatchModuleCache {
                 );
                 for (name, offset) in raw_ifuncs {
                     name_to_ifunc_old.entry(name).or_insert(offset);
+                }
+                let mut name_to_ifunc_type_old: HashMap<_, _> = symbols
+                    .code_symbol_map
+                    .par_iter()
+                    .filter_map(|(name, idx)| {
+                        let new_modules_unified_function = func_to_index.get(idx)?;
+                        let ty = raw_ifunc_types.get(new_modules_unified_function)?.clone();
+                        Some(((*name).to_string(), ty))
+                    })
+                    .collect();
+                for (name, ty) in raw_ifunc_types {
+                    name_to_ifunc_type_old.entry(name.to_string()).or_insert(ty);
                 }
                 tracing::info!(
                     dx_src = ?crate::TraceSrc::Dev,
@@ -277,6 +291,7 @@ impl HotpatchModuleCache {
                     path: original.to_path_buf(),
                     old_bytes: bytes,
                     symbol_ifunc_map,
+                    symbol_ifunc_types: name_to_ifunc_type_old,
                     old_exports,
                     old_imports,
                     old_wasm: module,
@@ -683,6 +698,7 @@ pub fn create_wasm_jump_table(patch: &Path, cache: &HotpatchModuleCache) -> Resu
         let name = import.name.as_str().to_string();
 
         if let Some(table_idx) = name_to_ifunc_old.get(import.name.as_str()) {
+            validate_ifunc_type_match(cache, &new, func_id, &name, "env import")?;
             new.imports.delete(env_func_import);
             convert_func_to_ifunc_call(
                 &mut new,
@@ -700,6 +716,12 @@ pub fn create_wasm_jump_table(patch: &Path, cache: &HotpatchModuleCache) -> Resu
                 .get(saved_name.as_str())
                 .or_else(|| name_to_ifunc_old.get(cast_import_name))
             {
+                let old_name = if name_to_ifunc_old.contains_key(saved_name.as_str()) {
+                    saved_name.as_str()
+                } else {
+                    cast_import_name
+                };
+                validate_ifunc_type_match(cache, &new, func_id, old_name, "env cast stub")?;
                 tracing::info!(
                     dx_src = ?crate::TraceSrc::Dev,
                     "[hotpatch] env cast stub '{}' -> '{}' -> ifunc idx {}",
@@ -731,6 +753,7 @@ pub fn create_wasm_jump_table(patch: &Path, cache: &HotpatchModuleCache) -> Resu
         if let Some(js_import_name) = import_walrus_to_js.get(name.as_str()) {
             let saved_name = format!("__saved_wbg_{}", js_import_name);
             if let Some(&table_idx) = name_to_ifunc_old.get(saved_name.as_str()) {
+                validate_ifunc_type_match(cache, &new, func_id, saved_name.as_str(), "env import")?;
                 tracing::info!(
                     dx_src = ?crate::TraceSrc::Dev,
                     "[hotpatch] env import -> saved_wbg '{}' -> ifunc idx {}",
@@ -875,6 +898,9 @@ pub fn create_wasm_jump_table(patch: &Path, cache: &HotpatchModuleCache) -> Resu
                 0
             });
 
+            if old_idx != 0 {
+                validate_ifunc_type_match(cache, &new, func_id, &name, "wbg_cast")?;
+            }
             convert_func_to_ifunc_call(&mut new, ifunc_table_initializer, func_id, old_idx, name);
         }
     }
@@ -905,11 +931,16 @@ pub fn create_wasm_jump_table(patch: &Path, cache: &HotpatchModuleCache) -> Resu
     let name_to_ifunc_new = collect_func_ifuncs(&new);
     let ifunc_count = count_element_segment_entries(&new);
     let mut map = AddressMap::default();
-    for (name, idx) in name_to_ifunc_new.iter() {
-        // Find the corresponding ifunc in the old module by name
-        if let Some(old_idx) = name_to_ifunc_old.get(*name) {
-            map.insert(*old_idx as u64, *idx as u64);
+    for func in new.funcs.iter() {
+        let Some(name) = func.name.as_deref() else {
             continue;
+        };
+        let Some(new_idx) = name_to_ifunc_new.get(name) else {
+            continue;
+        };
+        if let Some(old_idx) = name_to_ifunc_old.get(name) {
+            validate_ifunc_type_match(cache, &new, func.id(), name, "final ifunc remap")?;
+            map.insert(*old_idx as u64, *new_idx as u64);
         }
     }
 
@@ -920,6 +951,38 @@ pub fn create_wasm_jump_table(patch: &Path, cache: &HotpatchModuleCache) -> Resu
         aslr_reference: 0,
         new_base_address: 0,
     })
+}
+
+fn validate_ifunc_type_match(
+    cache: &HotpatchModuleCache,
+    new: &Module,
+    func_id: FunctionId,
+    old_name: &str,
+    context: &str,
+) -> Result<()> {
+    let Some((old_params, old_results)) = cache.symbol_ifunc_types.get(old_name) else {
+        return Err(PatchError::InvalidModule(format!(
+            "Missing base wasm type information for {context} target '{old_name}'"
+        )));
+    };
+
+    let new_ty = new.types.get(new.funcs.get(func_id).ty());
+    let new_params = new_ty.params().to_vec();
+    let new_results = new_ty.results().to_vec();
+
+    if *old_params != new_params || *old_results != new_results {
+        let new_name = new
+            .funcs
+            .get(func_id)
+            .name
+            .as_deref()
+            .unwrap_or("<unnamed>");
+        return Err(PatchError::InvalidModule(format!(
+            "Unsafe wasm hotpatch remap for {context}: new '{new_name}' has type ({new_params:?}) -> ({new_results:?}) but base target '{old_name}' has type ({old_params:?}) -> ({old_results:?})"
+        )));
+    }
+
+    Ok(())
 }
 
 fn convert_func_to_ifunc_call(
@@ -1008,6 +1071,17 @@ fn collect_func_ifuncs(m: &Module) -> HashMap<&str, i32> {
     }
 
     func_to_offset
+}
+
+fn collect_func_ifunc_types(m: &Module) -> HashMap<&str, (Vec<ValType>, Vec<ValType>)> {
+    m.funcs
+        .iter()
+        .filter_map(|func| {
+            let name = func.name.as_deref()?;
+            let ty = m.types.get(func.ty());
+            Some((name, (ty.params().to_vec(), ty.results().to_vec())))
+        })
+        .collect()
 }
 
 /// Count the total number of entries across all active element segments in the module.
