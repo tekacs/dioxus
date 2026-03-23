@@ -679,12 +679,22 @@ impl BuildRequest {
             else {
                 continue;
             };
-            let Some(dep_path) = self.find_rmeta_or_rlib_for_crate(&dependency, dep_args) else {
+            let dep_prefix = format!("{dependency}=");
+            let existing_dep_path = rewritten.args.windows(2).find_map(|window| {
+                (window[0] == "--extern" && window[1].starts_with(dep_prefix.as_str()))
+                    .then(|| PathBuf::from(window[1][dep_prefix.len()..].to_string()))
+            });
+            let preferred_ext = existing_dep_path
+                .as_ref()
+                .and_then(|path| path.extension())
+                .and_then(|ext| ext.to_str());
+            let Some(dep_path) =
+                self.find_workspace_dep_artifact(&dependency, dep_args, preferred_ext)
+            else {
                 continue;
             };
 
             let dep_flag = format!("{dependency}={}", dep_path.display());
-            let dep_prefix = format!("{dependency}=");
             let mut replaced = false;
             let mut idx = 0;
             while idx + 1 < rewritten.args.len() {
@@ -1505,11 +1515,32 @@ impl BuildRequest {
         })
     }
 
-    fn find_rmeta_or_rlib_for_crate(
+    fn find_workspace_dep_artifact(
         &self,
         crate_name: &str,
         rustc_args: &RustcArgs,
+        preferred_ext: Option<&str>,
     ) -> Option<PathBuf> {
+        if preferred_ext == Some("rlib") {
+            if let Ok(rlib) = self.find_rlib_for_crate(crate_name, rustc_args) {
+                return Some(rlib);
+            }
+        }
+
+        if preferred_ext == Some("rmeta") {
+            if let Some(rmeta) = self.find_rmeta_for_crate(crate_name, rustc_args) {
+                return Some(rmeta);
+            }
+        }
+
+        if let Some(rmeta) = self.find_rmeta_for_crate(crate_name, rustc_args) {
+            return Some(rmeta);
+        }
+
+        self.find_rlib_for_crate(crate_name, rustc_args).ok()
+    }
+
+    fn find_rmeta_for_crate(&self, crate_name: &str, rustc_args: &RustcArgs) -> Option<PathBuf> {
         let out_dir = rustc_args
             .args
             .iter()
@@ -1536,10 +1567,6 @@ impl BuildRequest {
             if exact_rmeta.exists() {
                 return Some(exact_rmeta);
             }
-        }
-
-        if let Ok(rlib) = self.find_rlib_for_crate(crate_name, rustc_args) {
-            return Some(rlib);
         }
 
         let prefix = format!("lib{crate_name}-");
