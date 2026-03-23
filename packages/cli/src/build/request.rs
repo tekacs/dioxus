@@ -1612,7 +1612,12 @@ impl BuildRequest {
                     .get(&format!("{}.bin", self.tip_crate_name()))
                     .context("Missing rustc args for tip crate")?;
 
-                self.replayed_rustc_command(build_mode, rustc_args, true)
+                let rustc_args = self.rewrite_workspace_dep_externs(
+                    &self.tip_crate_name(),
+                    rustc_args,
+                    workspace_rustc_args,
+                );
+                self.replayed_rustc_command(build_mode, &rustc_args, true)
             }
 
             // For Base and Fat builds, we use a regular cargo setup, but we intercept rustc for

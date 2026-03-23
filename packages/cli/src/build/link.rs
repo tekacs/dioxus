@@ -155,7 +155,7 @@ impl BuildRequest {
             let rustc_args = self
                 .workspace_hotpatch_replay_args(workspace_rustc_args, crate_name)
                 .with_context(|| format!("Missing rustc args for replay: '{crate_name}'"))?;
-            self.compile_dep_crate(ctx, crate_name, rustc_args)
+            self.compile_dep_crate(ctx, crate_name, rustc_args, workspace_rustc_args)
                 .await
                 .with_context(|| format!("Failed to replay workspace crate '{crate_name}'"))?;
         }
@@ -523,7 +523,10 @@ impl BuildRequest {
         ctx: &BuildContext,
         crate_name: &str,
         rustc_args: &RustcArgs,
+        workspace_rustc_args: &WorkspaceRustcArgs,
     ) -> Result<()> {
+        let rustc_args =
+            self.rewrite_workspace_dep_externs(crate_name, rustc_args, workspace_rustc_args);
         let mut cmd = Command::new("rustc");
         cmd.current_dir(rustc_args.cwd.clone());
         cmd.env_clear();
@@ -659,6 +662,84 @@ impl BuildRequest {
         }
 
         Ok(())
+    }
+
+    pub(crate) fn rewrite_workspace_dep_externs(
+        &self,
+        crate_name: &str,
+        rustc_args: &RustcArgs,
+        workspace_rustc_args: &WorkspaceRustcArgs,
+    ) -> RustcArgs {
+        let mut rewritten = rustc_args.clone();
+
+        for dependency in self.workspace_dependencies_of(crate_name) {
+            let Some(dep_args) = workspace_rustc_args
+                .rustc_args
+                .get(&format!("{dependency}.lib"))
+            else {
+                continue;
+            };
+            let Some(dep_path) = self.find_rmeta_or_rlib_for_crate(&dependency, dep_args) else {
+                continue;
+            };
+
+            let dep_flag = format!("{dependency}={}", dep_path.display());
+            let dep_prefix = format!("{dependency}=");
+            let mut replaced = false;
+            let mut idx = 0;
+            while idx + 1 < rewritten.args.len() {
+                if rewritten.args[idx] == "--extern"
+                    && rewritten.args[idx + 1].starts_with(dep_prefix.as_str())
+                {
+                    rewritten.args[idx + 1] = dep_flag.clone();
+                    replaced = true;
+                    break;
+                }
+                idx += 1;
+            }
+
+            if !replaced {
+                rewritten.args.push("--extern".to_string());
+                rewritten.args.push(dep_flag);
+            }
+        }
+
+        rewritten
+    }
+
+    fn workspace_dependencies_of(&self, crate_name: &str) -> Vec<String> {
+        let krates = &self.workspace.krates;
+
+        let Some(target_nid) = krates.workspace_members().find_map(|member| {
+            if let krates::Node::Krate { id, krate, .. } = member {
+                if krate.name.replace('-', "_") == crate_name {
+                    return krates.nid_for_kid(id);
+                }
+            }
+            None
+        }) else {
+            return Vec::new();
+        };
+
+        let workspace_names: HashSet<String> = krates
+            .workspace_members()
+            .filter_map(|member| {
+                if let krates::Node::Krate { krate, .. } = member {
+                    Some(krate.name.replace('-', "_"))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        krates
+            .direct_dependencies(target_nid)
+            .into_iter()
+            .filter_map(|dep| {
+                let name = dep.krate.name.replace('-', "_");
+                workspace_names.contains(&name).then_some(name)
+            })
+            .collect()
     }
 
     fn workspace_hotpatch_replay_args<'a>(
@@ -1422,6 +1503,60 @@ impl BuildRequest {
                 extra_filename
             )
         })
+    }
+
+    fn find_rmeta_or_rlib_for_crate(
+        &self,
+        crate_name: &str,
+        rustc_args: &RustcArgs,
+    ) -> Option<PathBuf> {
+        let out_dir = rustc_args
+            .args
+            .iter()
+            .zip(rustc_args.args.iter().skip(1))
+            .find(|(flag, _)| *flag == "--out-dir")
+            .map(|(_, dir)| PathBuf::from(dir))?;
+
+        let extra_filename = rustc_args.args.iter().enumerate().find_map(|(i, arg)| {
+            arg.strip_prefix("-Cextra-filename=")
+                .map(|s| s.to_string())
+                .or_else(|| {
+                    if arg == "-C" {
+                        rustc_args.args.get(i + 1).and_then(|next| {
+                            next.strip_prefix("extra-filename=").map(|s| s.to_string())
+                        })
+                    } else {
+                        None
+                    }
+                })
+        });
+
+        if let Some(extra) = &extra_filename {
+            let exact_rmeta = out_dir.join(format!("lib{crate_name}{extra}.rmeta"));
+            if exact_rmeta.exists() {
+                return Some(exact_rmeta);
+            }
+        }
+
+        if let Ok(rlib) = self.find_rlib_for_crate(crate_name, rustc_args) {
+            return Some(rlib);
+        }
+
+        let prefix = format!("lib{crate_name}-");
+        let entries = std::fs::read_dir(&out_dir).ok()?;
+        let mut best: Option<(PathBuf, std::time::SystemTime)> = None;
+        for entry in entries.flatten() {
+            if let Some(name) = entry.file_name().to_str() {
+                if name.starts_with(&prefix) && name.ends_with(".rmeta") {
+                    let mtime = entry.metadata().ok()?.modified().ok()?;
+                    if best.as_ref().is_none_or(|(_, t)| mtime > *t) {
+                        best = Some((entry.path(), mtime));
+                    }
+                }
+            }
+        }
+
+        best.map(|(path, _)| path)
     }
 
     fn rustc_wrapper_capture_mode(&self, build_mode: &BuildMode) -> &'static str {
