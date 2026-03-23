@@ -1460,7 +1460,7 @@ impl BuildRequest {
             };
 
             tracing::debug!("Compiling workspace dep crate: {crate_name}");
-            self.compile_dep_crate(&ctx.mode, &crate_name, rustc_args)
+            self.compile_dep_crate(&ctx.mode, &crate_name, rustc_args, workspace_rustc_args)
                 .await
                 .with_context(|| format!("Failed to compile workspace dep crate '{crate_name}'"))?;
 
@@ -1482,7 +1482,10 @@ impl BuildRequest {
                 .and_then(|m| m.modified().ok());
 
             tracing::info!("Compiling tip lib target: {lib_key}");
-            if let Err(e) = self.compile_dep_crate(&ctx.mode, &tip_name, lib_args).await {
+            if let Err(e) = self
+                .compile_dep_crate(&ctx.mode, &tip_name, lib_args, workspace_rustc_args)
+                .await
+            {
                 tracing::warn!("Failed to compile tip lib target: {e}");
             } else if let Some(rlib_path) = self.find_rlib_for_crate(&tip_name, lib_args) {
                 let post_modified = std::fs::metadata(&rlib_path)
@@ -3286,7 +3289,12 @@ impl BuildRequest {
                 let rustc_args = workspace_rustc_args
                     .get(&format!("{}.bin", self.tip_crate_name()))
                     .context("Missing rustc args for tip crate")?;
-                self.replayed_rustc_command(build_mode, rustc_args, true)
+                let rustc_args = self.rewrite_workspace_dep_externs(
+                    &self.tip_crate_name(),
+                    rustc_args,
+                    workspace_rustc_args,
+                );
+                self.replayed_rustc_command(build_mode, &rustc_args, true)
             }
 
             // For Base and Fat builds, we use a regular cargo setup, but we intercept rustc for
@@ -3377,6 +3385,46 @@ impl BuildRequest {
         }
 
         Ok(cmd)
+    }
+
+    fn rewrite_workspace_dep_externs(
+        &self,
+        crate_name: &str,
+        rustc_args: &RustcArgs,
+        workspace_rustc_args: &HashMap<String, RustcArgs>,
+    ) -> RustcArgs {
+        let mut rewritten = rustc_args.clone();
+
+        for dependency in self.workspace_dependencies_of(crate_name) {
+            let Some(dep_args) = workspace_rustc_args.get(&format!("{dependency}.lib")) else {
+                continue;
+            };
+            let Some(dep_path) = self.find_rmeta_or_rlib_for_crate(&dependency, dep_args) else {
+                continue;
+            };
+
+            let dep_flag = format!("{dependency}={}", dep_path.display());
+            let dep_prefix = format!("{dependency}=");
+            let mut replaced = false;
+            let mut idx = 0;
+            while idx + 1 < rewritten.args.len() {
+                if rewritten.args[idx] == "--extern"
+                    && rewritten.args[idx + 1].starts_with(dep_prefix.as_str())
+                {
+                    rewritten.args[idx + 1] = dep_flag.clone();
+                    replaced = true;
+                    break;
+                }
+                idx += 1;
+            }
+
+            if !replaced {
+                rewritten.args.push("--extern".to_string());
+                rewritten.args.push(dep_flag);
+            }
+        }
+
+        rewritten
     }
 
     /// Create a list of arguments for cargo builds
@@ -6011,8 +6059,11 @@ __wbg_init({{module_or_path: "/{}/{wasm_path}"}}).then((wasm) => {{
         build_mode: &BuildMode,
         crate_name: &str,
         rustc_args: &RustcArgs,
+        workspace_rustc_args: &HashMap<String, RustcArgs>,
     ) -> Result<()> {
-        let mut cmd = self.replayed_rustc_command(build_mode, rustc_args, false)?;
+        let rustc_args =
+            self.rewrite_workspace_dep_externs(crate_name, rustc_args, workspace_rustc_args);
+        let mut cmd = self.replayed_rustc_command(build_mode, &rustc_args, false)?;
         let output = cmd.output().await?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -6084,6 +6135,61 @@ __wbg_init({{module_or_path: "/{}/{wasm_path}"}}).then((wasm) => {{
         }
 
         None
+    }
+
+    fn find_rmeta_or_rlib_for_crate(
+        &self,
+        crate_name: &str,
+        rustc_args: &RustcArgs,
+    ) -> Option<PathBuf> {
+        // Prefer the exact rmeta next to the captured out-dir/extra-filename when available.
+        let out_dir = rustc_args
+            .args
+            .iter()
+            .zip(rustc_args.args.iter().skip(1))
+            .find(|(flag, _)| *flag == "--out-dir")
+            .map(|(_, dir)| PathBuf::from(dir))?;
+
+        let extra_filename = rustc_args.args.iter().enumerate().find_map(|(i, arg)| {
+            arg.strip_prefix("-Cextra-filename=")
+                .map(|s| s.to_string())
+                .or_else(|| {
+                    if arg == "-C" {
+                        rustc_args.args.get(i + 1).and_then(|next| {
+                            next.strip_prefix("extra-filename=").map(|s| s.to_string())
+                        })
+                    } else {
+                        None
+                    }
+                })
+        });
+
+        if let Some(extra) = &extra_filename {
+            let exact_rmeta = out_dir.join(format!("lib{crate_name}{extra}.rmeta"));
+            if exact_rmeta.exists() {
+                return Some(exact_rmeta);
+            }
+        }
+
+        let exact_rlib = self.find_rlib_for_crate(crate_name, rustc_args);
+        if exact_rlib.is_some() {
+            return exact_rlib;
+        }
+
+        let prefix = format!("lib{crate_name}-");
+        let entries = std::fs::read_dir(&out_dir).ok()?;
+        let mut best: Option<(PathBuf, std::time::SystemTime)> = None;
+        for entry in entries.flatten() {
+            if let Some(name) = entry.file_name().to_str() {
+                if name.starts_with(&prefix) && name.ends_with(".rmeta") {
+                    let mtime = entry.metadata().ok()?.modified().ok()?;
+                    if best.as_ref().map_or(true, |(_, t)| mtime > *t) {
+                        best = Some((entry.path(), mtime));
+                    }
+                }
+            }
+        }
+        best.map(|(path, _)| path)
     }
 
     /// with our hotpatching setup since it uses linker interception.
