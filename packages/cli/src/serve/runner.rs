@@ -687,6 +687,22 @@ impl AppServer {
                 // Otherwise hotpatches go through patching system
                 HotReloadMode::Hotpatch => {
                     let changed_crates = self.order_changed_crates(files);
+                    let hotpatch_tip_crates = self.hotpatch_tip_crates();
+                    let non_tip_crates = changed_crates
+                        .iter()
+                        .filter(|crate_name| !hotpatch_tip_crates.contains(*crate_name))
+                        .cloned()
+                        .collect::<Vec<_>>();
+
+                    if !non_tip_crates.is_empty() {
+                        use crate::styles::NOTE_STYLE;
+                        tracing::warn!(
+                            dx_src = ?TraceSrc::Dev,
+                            "Ignoring non-tip workspace change(s) for hotpatch: {NOTE_STYLE}{:?}{NOTE_STYLE:#}. Manual reload required.",
+                            non_tip_crates
+                        );
+                        return;
+                    }
 
                     self.client.patch_rebuild(
                         files.to_vec(),
@@ -756,6 +772,14 @@ impl AppServer {
                 tracing::debug!(dx_src = ?TraceSrc::Dev, "Ignoring file change: {}", file);
             }
         }
+    }
+
+    fn hotpatch_tip_crates(&self) -> HashSet<String> {
+        let mut tip_crates = HashSet::from([self.client.build.main_target.replace('-', "_")]);
+        if let Some(server) = self.server.as_ref() {
+            tip_crates.insert(server.build.main_target.replace('-', "_"));
+        }
+        tip_crates
     }
 
     /// Finally "bundle" this app and return a handle to it
