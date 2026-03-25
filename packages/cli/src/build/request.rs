@@ -3396,9 +3396,6 @@ impl BuildRequest {
         let mut rewritten = rustc_args.clone();
 
         for dependency in self.workspace_dependencies_of(crate_name) {
-            let Some(dep_args) = workspace_rustc_args.get(&format!("{dependency}.lib")) else {
-                continue;
-            };
             let dep_prefix = format!("{dependency}=");
             let existing_dep_path = rewritten.args.windows(2).find_map(|window| {
                 (window[0] == "--extern" && window[1].starts_with(dep_prefix.as_str()))
@@ -3408,6 +3405,7 @@ impl BuildRequest {
                 .as_ref()
                 .and_then(|path| path.extension())
                 .and_then(|ext| ext.to_str());
+            let dep_args = workspace_rustc_args.get(&format!("{dependency}.lib"));
             let Some(dep_path) =
                 self.find_workspace_dep_artifact(&dependency, dep_args, preferred_ext)
             else {
@@ -6150,26 +6148,83 @@ __wbg_init({{module_or_path: "/{}/{wasm_path}"}}).then((wasm) => {{
     fn find_workspace_dep_artifact(
         &self,
         crate_name: &str,
-        rustc_args: &RustcArgs,
+        rustc_args: Option<&RustcArgs>,
         preferred_ext: Option<&str>,
     ) -> Option<PathBuf> {
         if preferred_ext == Some("rlib") {
-            if let Some(rlib) = self.find_rlib_for_crate(crate_name, rustc_args) {
+            if let Some(rlib) =
+                rustc_args.and_then(|args| self.find_rlib_for_crate(crate_name, args))
+            {
+                return Some(rlib);
+            }
+            if let Some(rlib) =
+                self.find_workspace_dep_artifact_from_fingerprint(crate_name, "rlib")
+            {
                 return Some(rlib);
             }
         }
 
         if preferred_ext == Some("rmeta") {
-            if let Some(rmeta) = self.find_rmeta_for_crate(crate_name, rustc_args) {
+            if let Some(rmeta) =
+                rustc_args.and_then(|args| self.find_rmeta_for_crate(crate_name, args))
+            {
+                return Some(rmeta);
+            }
+            if let Some(rmeta) =
+                self.find_workspace_dep_artifact_from_fingerprint(crate_name, "rmeta")
+            {
                 return Some(rmeta);
             }
         }
 
-        if let Some(rmeta) = self.find_rmeta_for_crate(crate_name, rustc_args) {
+        if let Some(rmeta) = rustc_args.and_then(|args| self.find_rmeta_for_crate(crate_name, args))
+        {
+            return Some(rmeta);
+        }
+        if let Some(rmeta) = self.find_workspace_dep_artifact_from_fingerprint(crate_name, "rmeta")
+        {
             return Some(rmeta);
         }
 
-        self.find_rlib_for_crate(crate_name, rustc_args)
+        rustc_args
+            .and_then(|args| self.find_rlib_for_crate(crate_name, args))
+            .or_else(|| self.find_workspace_dep_artifact_from_fingerprint(crate_name, "rlib"))
+    }
+
+    fn find_workspace_dep_artifact_from_fingerprint(
+        &self,
+        crate_name: &str,
+        extension: &str,
+    ) -> Option<PathBuf> {
+        let target_root = self
+            .target_dir
+            .join(self.triple.to_string())
+            .join(&self.profile);
+        let fingerprint_dir = target_root.join(".fingerprint");
+        let deps_dir = target_root.join("deps");
+        let crate_prefix = format!("{}-", crate_name.replace('_', "-"));
+
+        let mut candidates = std::fs::read_dir(&fingerprint_dir)
+            .ok()?
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name();
+                let name = name.to_str()?;
+                let hash = name.strip_prefix(crate_prefix.as_str())?;
+                let mtime = entry.metadata().ok()?.modified().ok()?;
+                Some((hash.to_string(), mtime))
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|(_, mtime)| *mtime);
+
+        for (hash, _) in candidates.into_iter().rev() {
+            let candidate = deps_dir.join(format!("lib{crate_name}-{hash}.{extension}"));
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+
+        None
     }
 
     fn find_rmeta_for_crate(&self, crate_name: &str, rustc_args: &RustcArgs) -> Option<PathBuf> {
