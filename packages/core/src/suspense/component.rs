@@ -286,7 +286,7 @@ impl SuspenseBoundaryProps {
                     .clone()
                     .with_suspense_location(suspense_boundary_location, || {
                         let scope_state = dom
-                            .new_scope(component.props.duplicate(), component.name)
+                            .new_scope(component.props.duplicate(), component.name, None)
                             .state();
                         suspense_context.mount(scope_state.id);
                         scope_id = scope_state.id;

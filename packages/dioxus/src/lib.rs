@@ -240,7 +240,8 @@ pub mod prelude {
 
     #[doc(inline)]
     pub use dioxus_core::{
-        consume_context, provide_context, spawn, suspend, try_consume_context, use_drop, use_hook,
+        consume_context, current_scope_key, current_scope_name, provide_context, spawn, suspend,
+        try_consume_context, use_drop, use_hook,
         AnyhowContext, Attribute, Callback, Component, Element, ErrorBoundary, ErrorContext, Event,
         EventHandler, Fragment, HasAttributes, IntoDynNode, RenderError, Result, ScopeId,
         SuspenseBoundary, SuspenseContext, VNode, VirtualDom,
