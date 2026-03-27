@@ -12,6 +12,7 @@ impl VirtualDom {
         &mut self,
         props: BoxedAnyProps,
         name: &'static str,
+        key: Option<String>,
     ) -> &mut ScopeState {
         let parent_id = self.runtime.try_current_scope_id();
         let height = match parent_id.and_then(|id| self.runtime.try_get_state(id)) {
@@ -25,12 +26,13 @@ impl VirtualDom {
         let entry = self.scopes.vacant_entry();
         let id = ScopeId(entry.key());
 
-        let scope_runtime = Scope::new(name, id, parent_id, height, suspense_boundary);
+        let scope_runtime = Scope::new(name, key.clone(), id, parent_id, height, suspense_boundary);
         let reactive_context = ReactiveContext::new_for_scope(&scope_runtime, &self.runtime);
 
         let scope = entry.insert(ScopeState {
             runtime: self.runtime.clone(),
             context_id: id,
+            key,
             props,
             last_rendered_node: Default::default(),
             reactive_context,

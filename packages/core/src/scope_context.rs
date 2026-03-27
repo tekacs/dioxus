@@ -44,6 +44,7 @@ impl SuspenseLocation {
 /// This struct exists to provide a common interface for all scopes without relying on generics.
 pub(crate) struct Scope {
     pub(crate) name: &'static str,
+    pub(crate) key: Option<String>,
     pub(crate) id: ScopeId,
     pub(crate) parent_id: Option<ScopeId>,
     pub(crate) height: u32,
@@ -66,6 +67,7 @@ pub(crate) struct Scope {
 impl Scope {
     pub(crate) fn new(
         name: &'static str,
+        key: Option<String>,
         id: ScopeId,
         parent_id: Option<ScopeId>,
         height: u32,
@@ -73,6 +75,7 @@ impl Scope {
     ) -> Self {
         Self {
             name,
+            key,
             id,
             parent_id,
             height,

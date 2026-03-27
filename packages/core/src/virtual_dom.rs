@@ -322,7 +322,7 @@ impl VirtualDom {
             RootProps(root),
             "RootWrapper",
         );
-        dom.new_scope(Box::new(root), "app");
+        dom.new_scope(Box::new(root), "app", None);
 
         #[cfg(debug_assertions)]
         dom.register_subsecond_handler();

@@ -73,6 +73,8 @@ impl ScopeId {
 pub struct ScopeState {
     pub(crate) runtime: Rc<Runtime>,
     pub(crate) context_id: ScopeId,
+    /// The key prop passed to this component by the parent, if any.
+    pub(crate) key: Option<String>,
     /// The last node that has been rendered for this component. This node may not ben mounted
     /// During suspense, this component can be rendered in the background multiple times
     pub(crate) last_rendered_node: Option<LastRenderedNode>,
@@ -116,6 +118,16 @@ impl ScopeState {
     /// Returns the height of this scope in the tree.
     pub fn height(&self) -> u32 {
         self.state().height()
+    }
+
+    /// Returns the component's function name.
+    pub fn name(&self) -> &'static str {
+        self.state().name
+    }
+
+    /// Returns the component's key prop, if one was provided by the parent.
+    pub fn key(&self) -> Option<&str> {
+        self.key.as_deref()
     }
 }
 

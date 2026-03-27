@@ -9,6 +9,16 @@ pub fn current_scope_id() -> ScopeId {
     Runtime::with(|rt| rt.current_scope_id())
 }
 
+/// Get the current component's function name.
+pub fn current_scope_name() -> &'static str {
+    Runtime::with_current_scope(|scope| scope.name)
+}
+
+/// Get the current component's key prop, if one was provided by the parent.
+pub fn current_scope_key() -> Option<String> {
+    Runtime::with_current_scope(|scope| scope.key.clone())
+}
+
 /// Throw a [`CapturedError`] into the current scope. The error will bubble up to the nearest [`crate::ErrorBoundary()`] or the root of the app.
 ///
 /// # Examples

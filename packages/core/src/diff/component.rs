@@ -191,7 +191,11 @@ impl VNode {
         // If the scopeid is a placeholder, we need to load up a new scope for this vcomponent. If it's already mounted, then we can just use that
         if scope_id.is_placeholder() {
             scope_id = dom
-                .new_scope(component.props.duplicate(), component.name)
+                .new_scope(
+                    component.props.duplicate(),
+                    component.name,
+                    self.key.clone(),
+                )
                 .state()
                 .id;
 
