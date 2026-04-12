@@ -14,6 +14,7 @@ use tokio::process::Command;
 
 pub struct Workspace {
     pub(crate) krates: Krates,
+    pub(crate) cargo_metadata: krates::Metadata,
     pub(crate) settings: CliSettings,
     pub(crate) wasm_opt: Option<PathBuf>,
     pub(crate) sysroot: PathBuf,
@@ -52,7 +53,8 @@ impl Workspace {
 
             let mut builder = krates::Builder::new();
             builder.workspace(true);
-            let res = builder.build(cmd, |_| {})?;
+            let metadata = krates::cm::MetadataCommand::from(cmd).exec()?;
+            let res = builder.build_with_metadata(metadata.clone(), |_| {})?;
 
             if !lock_options.offline {
                 if let Ok(res) = std::env::var("SIMULATE_SLOW_NETWORK") {
@@ -60,7 +62,7 @@ impl Workspace {
                 }
             }
 
-            Ok(res) as Result<Krates, krates::Error>
+            Ok((metadata, res)) as Result<(krates::Metadata, Krates), krates::Error>
         });
 
         let spin_future = async move {
@@ -79,7 +81,7 @@ impl Workspace {
             }
         };
 
-        let krates = tokio::select! {
+        let (cargo_metadata, krates) = tokio::select! {
             f = krates_future => {
                 let res = f?;
                 if let Err(krates::Error::Metadata(e)) = res {
@@ -111,6 +113,7 @@ impl Workspace {
 
         let workspace = Arc::new(Self {
             krates,
+            cargo_metadata,
             settings,
             wasm_opt,
             sysroot: sysroot.trim().into(),
@@ -342,10 +345,35 @@ impl Workspace {
         };
 
         // if we have default members specified, try them first
-        if let Some(ws) = &self.cargo_toml.workspace {
+        if !krates::cm::workspace_default_members_is_missing(
+            &self.cargo_metadata.workspace_default_members,
+        ) {
+            for default in self.cargo_metadata.workspace_default_packages() {
+                if !default
+                    .targets
+                    .iter()
+                    .any(|t| t.kind.contains(&krates::cm::TargetKind::Bin))
+                {
+                    continue;
+                }
+
+                if let Some(node_id) = self.krates.nid_for_kid(&default.id.clone().into()) {
+                    return Ok(node_id);
+                }
+            }
+        } else if let Some(ws) = &self.cargo_toml.workspace {
+            let workspace_root = self.workspace_root();
+
             for default in &ws.default_members {
                 let mut workspace_members = self.krates.workspace_members();
-                let default_member_path = std::fs::canonicalize(default).unwrap();
+                let default_member_path = if Path::new(default).is_absolute() {
+                    PathBuf::from(default)
+                } else {
+                    workspace_root.join(default)
+                };
+                let Ok(default_member_path) = dunce::canonicalize(default_member_path) else {
+                    continue;
+                };
 
                 let found = workspace_members.find_map(|node| {
                     if let krates::Node::Krate { id, krate, .. } = node {
@@ -357,8 +385,11 @@ impl Workspace {
                         {
                             return None;
                         }
-                        let member_path =
-                            std::fs::canonicalize(krate.manifest_path.parent().unwrap()).unwrap();
+                        let Ok(member_path) =
+                            dunce::canonicalize(krate.manifest_path.parent().unwrap())
+                        else {
+                            return None;
+                        };
                         if member_path == default_member_path {
                             return Some(id);
                         }
