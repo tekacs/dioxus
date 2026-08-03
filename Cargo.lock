@@ -3279,6 +3279,7 @@ dependencies = [
  "indoc",
  "itertools 0.14.0",
  "krates",
+ "libc",
  "lightningcss",
  "log",
  "manganis",
@@ -3304,6 +3305,7 @@ dependencies = [
  "reqwest 0.12.28",
  "rhai_codegen",
  "rpm",
+ "rustc-stable-hash",
  "rustls",
  "schemars",
  "self-replace",
@@ -10994,6 +10996,12 @@ name = "rustc-hash"
 version = "2.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94300abf3f1ae2e2b8ffb7b58043de3d399c73fa6f4b73826402a5c457614dbe"
+
+[[package]]
+name = "rustc-stable-hash"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "781442f29170c5c93b7185ad559492601acdc71d5bb0706f5868094f45cfcd08"
 
 [[package]]
 name = "rustc_version"

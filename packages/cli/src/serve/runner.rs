@@ -1848,11 +1848,9 @@ impl AppServer {
     /// skipped so the user can fix the file without us crashing the serve session.
     async fn recreate_build_requests(&mut self) -> Result<()> {
         // Capture state from the existing `BuildRequest`s that must survive recreation.
-        // `session_cache_dir` holds files written by `prebuild` (link_err.txt, link_args.json,
-        // etc.) that subsequent build steps `dunce::canonicalize` and require to exist.
-        // `start_rebuild` skips `prebuild`, so a fresh empty tempdir on the new request would
-        // fail with ENOENT during `cargo_build_env_vars`. Carry the path over so the existing
-        // files stay reachable.
+        // `session_cache_dir` owns rustc captures, generation-specific linker captures, and
+        // hotpatch caches. Carry it across config reloads so the rebuilt request stays in the
+        // same serve session while each new build still receives fresh linker paths.
         let preserved_client_session_cache = self.client.build.session_cache_dir.clone();
         let preserved_server_session_cache = self
             .server

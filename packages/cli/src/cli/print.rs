@@ -64,7 +64,7 @@ impl Print {
                 let targets = opts.args.into_targets().await?;
                 let mode = BuildMode::Base;
                 let args = targets.client.cargo_build_arguments(&mode);
-                let env = targets.client.cargo_build_env_vars(&mode)?;
+                let env = targets.client.cargo_build_env_vars(&mode, None)?;
                 Self::print_as_unified_command(&env, &args, &opts.style);
                 Ok(StructuredOutput::PrintCargoArgs {
                     args,
@@ -81,7 +81,7 @@ impl Print {
                     .server
                     .context("No server target found, cannot print server args")?;
                 let args = server.cargo_build_arguments(&mode);
-                let env = server.cargo_build_env_vars(&mode)?;
+                let env = server.cargo_build_env_vars(&mode, None)?;
                 Self::print_as_unified_command(&env, &args, &print_cargo_args.style);
                 Ok(StructuredOutput::PrintCargoArgs {
                     args,

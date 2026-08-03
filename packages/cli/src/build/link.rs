@@ -17,7 +17,7 @@
 use super::HotpatchModuleCache;
 use crate::{BuildArtifacts, BuildMode, WorkspaceRustcArgs};
 use crate::{BuildContext, Error, LinkerFlavor, Result, RustcArgs, Workspace};
-use crate::{BuildRequest, DX_RUSTC_WRAPPER_ENV_VAR};
+use crate::{BuildRequest, DX_RUSTC_WRAPPER_ENV_VAR, LinkCapture};
 use anyhow::{Context, bail, ensure};
 use cargo_metadata::diagnostic::Diagnostic;
 use depinfo::RustcDepInfo;
@@ -954,6 +954,7 @@ impl BuildRequest {
         ctx: &BuildContext,
         exe: &Path,
         set: &WorkspaceRustcArgs,
+        capture: &LinkCapture,
     ) -> Result<()> {
         // Get the tip crate rustc argsa
         let rustc_args = set
@@ -1010,7 +1011,11 @@ impl BuildRequest {
         // Check if we already have a cached object file
         let out_ar_path = exe.with_file_name(format!("libdeps-{hash_id}.a",));
         let out_rlibs_list = exe.with_file_name(format!("rlibs-{hash_id}.txt"));
-        let mut archive_has_contents = out_ar_path.exists();
+        // The rlib list is the archive's completion receipt. A failed link can leave the
+        // archive behind before that receipt is written; reusing it would silently omit
+        // every compiler rlib, including core and alloc.
+        let cache_complete = out_ar_path.exists() && out_rlibs_list.exists();
+        let mut archive_has_contents = cache_complete;
 
         // Use the rlibs list if it exists
         let mut compiler_rlibs = std::fs::read_to_string(&out_rlibs_list)
@@ -1026,7 +1031,7 @@ impl BuildRequest {
         //
         // Since we're using the git hash for the CLI entropy, debug builds should always regenerate
         // the archive since their hash might not change, but the logic might.
-        if !archive_has_contents || cfg!(debug_assertions) {
+        if !cache_complete || cfg!(debug_assertions) {
             compiler_rlibs.clear();
 
             let mut bytes = vec![];
@@ -1108,41 +1113,45 @@ impl BuildRequest {
         let mut args: Vec<_> = set.link_args.clone();
         if let Some(last_object) = args.iter().rposition(|arg| arg.ends_with(".o")) {
             if archive_has_contents {
+                // Archives must follow every direct object so their lazy symbol resolution sees
+                // the complete unresolved set. Inserting at `last_object` left one codegen unit
+                // after the compiler rlibs and could strand its core/alloc references.
+                let after_objects = last_object + 1;
                 match self.linker_flavor() {
                     LinkerFlavor::WasmLld => {
-                        args.insert(last_object, "--whole-archive".to_string());
-                        args.insert(last_object + 1, out_ar_path.display().to_string());
-                        args.insert(last_object + 2, "--no-whole-archive".to_string());
+                        args.insert(after_objects, "--whole-archive".to_string());
+                        args.insert(after_objects + 1, out_ar_path.display().to_string());
+                        args.insert(after_objects + 2, "--no-whole-archive".to_string());
                         args.retain(|arg| !arg.ends_with(".rlib"));
                         for rlib in compiler_rlibs.iter().rev() {
-                            args.insert(last_object + 3, rlib.display().to_string());
+                            args.insert(after_objects + 3, rlib.display().to_string());
                         }
                     }
                     LinkerFlavor::Gnu => {
-                        args.insert(last_object, "-Wl,--whole-archive".to_string());
-                        args.insert(last_object + 1, out_ar_path.display().to_string());
-                        args.insert(last_object + 2, "-Wl,--no-whole-archive".to_string());
+                        args.insert(after_objects, "-Wl,--whole-archive".to_string());
+                        args.insert(after_objects + 1, out_ar_path.display().to_string());
+                        args.insert(after_objects + 2, "-Wl,--no-whole-archive".to_string());
                         args.retain(|arg| !arg.ends_with(".rlib"));
                         for rlib in compiler_rlibs.iter().rev() {
-                            args.insert(last_object + 3, rlib.display().to_string());
+                            args.insert(after_objects + 3, rlib.display().to_string());
                         }
                     }
                     LinkerFlavor::Darwin => {
-                        args.insert(last_object, "-Wl,-force_load".to_string());
-                        args.insert(last_object + 1, out_ar_path.display().to_string());
+                        args.insert(after_objects, "-Wl,-force_load".to_string());
+                        args.insert(after_objects + 1, out_ar_path.display().to_string());
                         args.retain(|arg| !arg.ends_with(".rlib"));
                         for rlib in compiler_rlibs.iter().rev() {
-                            args.insert(last_object + 2, rlib.display().to_string());
+                            args.insert(after_objects + 2, rlib.display().to_string());
                         }
                     }
                     LinkerFlavor::Msvc => {
                         args.insert(
-                            last_object,
+                            after_objects,
                             format!("/WHOLEARCHIVE:{}", out_ar_path.display()),
                         );
                         args.retain(|arg| !arg.ends_with(".rlib"));
                         for rlib in compiler_rlibs.iter().rev() {
-                            args.insert(last_object + 1, rlib.display().to_string());
+                            args.insert(after_objects + 1, rlib.display().to_string());
                         }
                     }
                     LinkerFlavor::Unsupported => {
@@ -1231,9 +1240,9 @@ impl BuildRequest {
         let mut out_args = args.clone();
         if cfg!(windows) {
             let cmd_contents: String = out_args.iter().map(|f| format!("\"{f}\"")).join(" ");
-            std::fs::write(self.windows_command_file(), cmd_contents)
+            std::fs::write(&capture.command, cmd_contents)
                 .context("Failed to write linker command file")?;
-            out_args = vec![format!("@{}", self.windows_command_file().display())];
+            out_args = vec![format!("@{}", capture.command.display())];
         }
 
         // Add more search paths for the linker

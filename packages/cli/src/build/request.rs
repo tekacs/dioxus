@@ -196,25 +196,29 @@
 use super::HotpatchModuleCache;
 use crate::{
     AndroidTools, BuildContext, BuildId, BundleFormat, DX_RUSTC_WRAPPER_ENV_VAR, DioxusConfig,
-    LinkAction, Platform, Renderer, Result, RustcArgs, TargetArgs, Workspace,
+    LinkAction, LinkCapture, Platform, Renderer, Result, RustcArgs, TargetArgs, Workspace,
 };
 use crate::{
     WorkspaceRustcArgs,
     opt::{AppManifest, process_file_to},
 };
-use anyhow::{Context, bail};
+use anyhow::{Context, bail, ensure};
 use cargo_metadata::diagnostic::Diagnostic;
 use cargo_toml::{Profile, Profiles, StripSetting};
 use depinfo::RustcDepInfo;
 use dioxus_cli_config::PRODUCT_NAME_ENV;
 use dioxus_cli_config::{APP_TITLE_ENV, ASSET_ROOT_ENV};
+use fs2::FileExt;
 use krates::{NodeId, cm::TargetKind};
 use manganis::BundledAsset;
 use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 use serde::Deserialize;
-use std::{borrow::Cow, collections::VecDeque, ffi::OsString};
 use std::{
-    collections::HashSet,
+    borrow::Cow,
+    collections::{HashSet, VecDeque},
+    ffi::OsString,
+    fs::OpenOptions,
+    hash::{Hash, Hasher},
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
@@ -226,6 +230,104 @@ use std::{
 use target_lexicon::{Architecture, OperatingSystem, Triple};
 use tempfile::TempDir;
 use tokio::{io::AsyncBufReadExt, process::Command};
+
+struct CargoGroup {
+    pid: Option<i32>,
+}
+
+impl CargoGroup {
+    fn new(child: &tokio::process::Child) -> Self {
+        Self {
+            pid: child.id().and_then(|pid| i32::try_from(pid).ok()),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.pid = None;
+    }
+}
+
+impl Drop for CargoGroup {
+    fn drop(&mut self) {
+        if let Some(pid) = self.pid {
+            kill_group(pid);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn kill_group(pid: i32) {
+    // Cargo starts in a fresh process group. Kill the group so aborting the
+    // build task cannot leave rustc or linker grandchildren running.
+    _ = unsafe { libc::kill(-pid, libc::SIGKILL) };
+}
+
+#[cfg(not(unix))]
+fn kill_group(_pid: i32) {}
+
+fn resolve_build_dir(path: &Path, workspace: &Path, home: Option<&Path>) -> Result<PathBuf> {
+    let manifest = workspace.join("Cargo.toml");
+    let manifest = std::fs::canonicalize(&manifest).unwrap_or(manifest);
+    let mut hasher = rustc_stable_hash::StableSipHasher128::new();
+    manifest.hash(&mut hasher);
+    let hash = Hasher::finish(&hasher)
+        .to_le_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let hash = format!("{}{}{}", &hash[..2], std::path::MAIN_SEPARATOR, &hash[2..]);
+
+    let raw = path.to_string_lossy();
+    let mut resolved = raw.replace("{workspace-root}", &workspace.to_string_lossy());
+    if resolved.contains("{cargo-cache-home}") {
+        let home = home.context("Could not resolve {cargo-cache-home} in build.build-dir")?;
+        resolved = resolved.replace("{cargo-cache-home}", &home.to_string_lossy());
+    }
+    resolved = resolved.replace("{workspace-path-hash}", &hash);
+    ensure!(
+        !resolved.contains(['{', '}']),
+        "Unsupported template in build.build-dir: {raw}"
+    );
+    Ok(PathBuf::from(resolved))
+}
+
+fn invalidate_fingerprints(profile: &Path, packages: &HashSet<String>) -> Result<()> {
+    std::fs::create_dir_all(profile).context("Failed to create Cargo profile directory")?;
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(profile.join(".cargo-build-lock"))
+        .context("Failed to open Cargo build lock")?;
+    FileExt::lock_exclusive(&lock).context("Failed to acquire Cargo build lock")?;
+
+    for entry in std::fs::read_dir(profile.join(".fingerprint"))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        if let Some((name, _)) = entry.file_name().to_string_lossy().rsplit_once('-') {
+            if packages.contains(name) {
+                std::fs::remove_dir_all(entry.path())
+                    .context("Failed to invalidate Cargo fingerprint")?;
+            }
+        }
+    }
+
+    for package in packages {
+        let units = profile.join("build").join(package);
+        for unit in std::fs::read_dir(units).into_iter().flatten().flatten() {
+            let fingerprint = unit.path().join("fingerprint");
+            if fingerprint.is_dir() {
+                std::fs::remove_dir_all(fingerprint)
+                    .context("Failed to invalidate Cargo build unit")?;
+            }
+        }
+    }
+
+    Ok(())
+}
 
 /// This struct is used to plan the build process.
 ///
@@ -259,6 +361,7 @@ pub(crate) struct BuildRequest {
     pub(crate) extra_rustc_args: Vec<String>,
     pub(crate) all_features: bool,
     pub(crate) target_dir: PathBuf,
+    pub(crate) build_dir: PathBuf,
     pub(crate) skip_assets: bool,
     pub(crate) wasm_split: bool,
     pub(crate) debug_symbols: bool,
@@ -737,7 +840,12 @@ impl BuildRequest {
         // This involves specifically two fields:
         // - The linker since we override it for Android and hotpatching
         // - RUSTFLAGS since we also override it for Android and hotpatching
-        let cargo_config = cargo_config2::Config::load().unwrap();
+        let cargo_cwd = main_package
+            .manifest_path
+            .parent()
+            .context("Package manifest has no parent directory")?;
+        let cargo_config = cargo_config2::Config::load_with_cwd(cargo_cwd.as_std_path())
+            .context("Failed to load Cargo configuration")?;
         let mut custom_linker = cargo_config.linker(triple.to_string()).ok().flatten();
         let mut rustflags = cargo_config2::Flags::default();
 
@@ -842,11 +950,24 @@ impl BuildRequest {
             );
         }
 
-        let target_dir = std::env::var("CARGO_TARGET_DIR")
-            .ok()
-            .map(PathBuf::from)
-            .or_else(|| cargo_config.build.target_dir.clone())
+        let target_dir = cargo_config
+            .build
+            .target_dir
+            .clone()
             .unwrap_or_else(|| workspace.workspace_root().join("target"));
+        let configured_build_dir = cargo_config
+            .build
+            .build_dir
+            .as_deref()
+            .unwrap_or(&target_dir);
+        let cargo_home = std::env::var_os("CARGO_HOME")
+            .map(PathBuf::from)
+            .or_else(|| dirs::home_dir().map(|home| home.join(".cargo")));
+        let build_dir = resolve_build_dir(
+            configured_build_dir,
+            &workspace.workspace_root(),
+            cargo_home.as_deref(),
+        )?;
 
         // If the user provided a profile and wasm_split is enabled, we should check that LTO=true and debug=true
         if args.wasm_split {
@@ -886,7 +1007,8 @@ impl BuildRequest {
                 • bundle format: {bundle:?}
                 • session cache dir: {session_cache_dir:?}
                 • linker: {custom_linker:?}
-                • target_dir: {target_dir:?}"#,
+                • target_dir: {target_dir:?}
+                • build_dir: {build_dir:?}"#,
         );
 
         Ok(Self {
@@ -901,6 +1023,7 @@ impl BuildRequest {
             workspace,
             config,
             target_dir,
+            build_dir,
             custom_linker,
             extra_rustc_args,
             extra_cargo_args,
@@ -932,9 +1055,6 @@ impl BuildRequest {
         _ = std::fs::create_dir_all(&cache_dir);
         _ = std::fs::create_dir_all(self.rustc_wrapper_args_dir());
         _ = std::fs::create_dir_all(self.rustc_wrapper_args_scope_dir(&ctx.mode)?);
-        _ = std::fs::File::create(self.link_err_file());
-        _ = std::fs::File::create(self.link_args_file());
-        _ = std::fs::File::create(self.windows_command_file());
 
         if !matches!(ctx.mode, BuildMode::Thin { .. }) {
             self.prepare_build_dir(ctx)?;
@@ -1032,10 +1152,11 @@ impl BuildRequest {
     /// This method is only meant to be run by fat/full builds - not by hotpatch builds
     pub async fn cargo_build(&self, ctx: &BuildContext) -> Result<BuildArtifacts> {
         let time_start = SystemTime::now();
+        let capture = LinkCapture::new(self.session_cache_dir())?;
 
         // If we forget to do this, then we won't get the linker args since rust skips the full build
         // We need to make sure to not react to this though, so the filemap must cache it
-        _ = self.bust_fingerprint(ctx);
+        self.bust_fingerprint(ctx).await?;
 
         // Extract the unit count of the crate graph so build_cargo has more accurate data
         // "Thin" builds only build the final exe, so we only need to build one crate
@@ -1044,13 +1165,21 @@ impl BuildRequest {
             _ => self.get_unit_count_estimate(&ctx.mode).await,
         };
 
-        // Spawn the `cargo rustc` or `rustc` command
-        let mut child = self
-            .cargo_build_command(&ctx.mode)?
+        // Spawn the `cargo rustc` or `rustc` command. On Unix, every generation owns a
+        // process group so aborting the Tokio task also terminates Cargo's descendants.
+        let mut command = self.cargo_build_command(&ctx.mode, &capture)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.as_std_mut().process_group(0);
+        }
+        let mut child = command
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .kill_on_drop(true)
             .spawn()
             .context("Failed to spawn cargo build")?;
+        let mut group = CargoGroup::new(&child);
 
         // Direct rustc thin builds don't emit Cargo-style unit progress messages, so if we don't
         // advance the profiler here the entire compile winds up attributed to "Starting Build".
@@ -1157,18 +1286,31 @@ impl BuildRequest {
             }
         }
 
-        // If there's any warnings from the linker, we should print them out
-        self.print_linker_warnings(&output_location);
+        let status = child
+            .wait()
+            .await
+            .context("Failed to wait for cargo build")?;
+        group.disarm();
+        ensure!(
+            status.success(),
+            "cargo build failed for target: {} [{}] with status {status}",
+            self.main_target,
+            self.triple
+        );
 
-        // Load the captured rustc args from the rustc_workspace_wrapper
-        let workspace_rustc_args = self.load_rustc_argset()?;
+        // If there's any warnings from the linker, we should print them out
+        self.print_linker_warnings(&output_location, &capture);
+
+        // Load this generation's captured rustc and linker arguments.
+        let workspace_rustc_args = self.load_rustc_argset(&ctx.mode, &capture)?;
 
         // Ensure the final exe exists - throw if it doesn't
         let exe = output_location.context("Cargo build failed - no output location. Toggle tracing mode (press `t`) for more information.")?;
 
         // Fat builds need to be linked with the fat linker. Would also like to link here for thin builds
         if matches!(ctx.mode, BuildMode::Fat) {
-            self.run_fat_link(ctx, &exe, &workspace_rustc_args).await?;
+            self.run_fat_link(ctx, &exe, &workspace_rustc_args, &capture)
+                .await?;
         }
 
         // Asset extraction is starts bundle
@@ -1241,7 +1383,7 @@ impl BuildRequest {
     /// still valid and we skip busting so cargo can reuse its incremental artifacts. If the
     /// file is missing, we bust that crate's fingerprint to force the rustc wrapper to
     /// re-capture its args.
-    fn bust_fingerprint(&self, ctx: &BuildContext) -> Result<()> {
+    async fn bust_fingerprint(&self, ctx: &BuildContext) -> Result<()> {
         // Ensure the rustc args capture directory exists - only in fat/base builds.
         // This ensures we always capture fresh rustc args provided we're not hotpatching. This could
         // be annoying for regular dx build/bundle commands, but should generally be fine.
@@ -1276,20 +1418,10 @@ impl BuildRequest {
             }
         }
 
-        let fingerprint_dir = self.cargo_fingerprint_dir();
-        for entry in std::fs::read_dir(&fingerprint_dir)
-            .into_iter()
-            .flatten()
-            .flatten()
-        {
-            if let Some(fname) = entry.file_name().to_str() {
-                if let Some((name, _)) = fname.rsplit_once('-') {
-                    if bust.contains(name) {
-                        _ = std::fs::remove_dir_all(entry.path());
-                    }
-                }
-            }
-        }
+        let profile = self.cargo_profile_dir();
+        tokio::task::spawn_blocking(move || invalidate_fingerprints(&profile, &bust))
+            .await
+            .context("Cargo fingerprint invalidation task failed")??;
 
         Ok(())
     }
@@ -1590,7 +1722,11 @@ impl BuildRequest {
     ///
     /// When processing the output of this command, you need to make sure to handle both cases which
     /// both have different formats (but with json output for both).
-    fn cargo_build_command(&self, build_mode: &BuildMode) -> Result<Command> {
+    fn cargo_build_command(
+        &self,
+        build_mode: &BuildMode,
+        capture: &LinkCapture,
+    ) -> Result<Command> {
         match build_mode {
             // We're assembling rustc directly, so we need to be *very* careful. Cargo sets rustc's
             // env up very particularly, and we want to match it 1:1 but with some changes.
@@ -1617,7 +1753,7 @@ impl BuildRequest {
                     rustc_args,
                     workspace_rustc_args,
                 );
-                self.replayed_rustc_command(build_mode, &rustc_args, true)
+                self.replayed_rustc_command(build_mode, &rustc_args, true, capture)
             }
 
             // For Base and Fat builds, we use a regular cargo setup, but we intercept rustc for
@@ -1633,7 +1769,7 @@ impl BuildRequest {
             _ => {
                 let mut cmd = Command::new("cargo");
 
-                let env = self.cargo_build_env_vars(build_mode)?;
+                let env = self.cargo_build_env_vars(build_mode, Some(capture))?;
                 let args = self.cargo_build_arguments(build_mode);
 
                 tracing::trace!("Building with cargo rustc");
@@ -1675,6 +1811,7 @@ impl BuildRequest {
         build_mode: &BuildMode,
         rustc_args: &RustcArgs,
         use_dx_linker: bool,
+        capture: &LinkCapture,
     ) -> Result<Command> {
         let mut cmd = Command::from(rustc_args.replay());
         if rustc_args.cwd.as_os_str().is_empty() {
@@ -1692,7 +1829,7 @@ impl BuildRequest {
         }
 
         cmd.envs(
-            self.cargo_build_env_vars(build_mode)?
+            self.cargo_build_env_vars(build_mode, Some(capture))?
                 .iter()
                 .map(|(k, v)| (k.as_ref(), v)),
         );
@@ -1800,10 +1937,7 @@ impl BuildRequest {
         // dx links android, thin builds, and fat builds with a custom linker.
         // Note: We don't intercept Darwin Base builds since Swift plugins are compiled as dynamic
         // frameworks that load at runtime, not linked statically into the binary.
-        let use_dx_linker = self.custom_linker.is_some()
-            || matches!(build_mode, BuildMode::Thin { .. } | BuildMode::Fat);
-
-        if use_dx_linker {
+        if self.dx_links(build_mode) {
             cargo_args.push(format!(
                 "-Clinker={}",
                 Workspace::path_to_dx().expect("can't find dx").display()
@@ -1930,6 +2064,7 @@ impl BuildRequest {
     pub(crate) fn cargo_build_env_vars(
         &self,
         build_mode: &BuildMode,
+        capture: Option<&LinkCapture>,
     ) -> Result<Vec<(Cow<'static, str>, OsString)>> {
         let mut env_vars = vec![];
 
@@ -1971,17 +2106,25 @@ impl BuildRequest {
         // If we're either zero-linking or using a custom linker, make `dx` itself do the linking.
         // Note: We don't intercept Darwin Base builds since Swift plugins are compiled as dynamic
         // frameworks that load at runtime, not linked statically into the binary.
-        let use_dx_linker = self.custom_linker.is_some()
-            || matches!(build_mode, BuildMode::Thin { .. } | BuildMode::Fat);
+        if self.dx_links(build_mode) {
+            // Unit-graph and print-only callers do not execute the linker, but still need
+            // representative paths. Real builds always supply a generation-owned capture.
+            let preview;
+            let capture = match capture {
+                Some(capture) => capture,
+                None => {
+                    preview = LinkCapture::preview(self.session_cache_dir());
+                    &preview
+                }
+            };
 
-        if use_dx_linker {
             // For Android, we pass the actual linker so cargo can still link normally.
             // For Fat/Thin builds, we use no-link mode (linker = None).
             LinkAction {
                 triple: self.triple.clone(),
                 linker: self.custom_linker.clone(),
-                link_err_file: dunce::canonicalize(self.link_err_file())?,
-                link_args_file: dunce::canonicalize(self.link_args_file())?,
+                link_err_file: capture.errors.clone(),
+                link_args_file: capture.args.clone(),
             }
             .write_env_vars(&mut env_vars)?;
         }
@@ -2422,7 +2565,7 @@ impl BuildRequest {
             .arg("unstable-options")
             .args(self.cargo_build_arguments(build_mode))
             .envs(
-                self.cargo_build_env_vars(build_mode)?
+                self.cargo_build_env_vars(build_mode, None)?
                     .iter()
                     .map(|(k, v)| (k.as_ref(), v)),
             )
@@ -2444,8 +2587,8 @@ impl BuildRequest {
         Ok(graph.units.len())
     }
 
-    fn print_linker_warnings(&self, exe_output_location: &Option<PathBuf>) {
-        if let Ok(linker_warnings) = std::fs::read_to_string(self.link_err_file()) {
+    fn print_linker_warnings(&self, exe_output_location: &Option<PathBuf>, capture: &LinkCapture) {
+        if let Ok(linker_warnings) = std::fs::read_to_string(&capture.errors) {
             if !linker_warnings.is_empty() {
                 if exe_output_location.is_none() {
                     tracing::error!("Linker warnings: {}", linker_warnings);
@@ -2461,12 +2604,25 @@ impl BuildRequest {
     /// Each workspace crate compiled through the wrapper has its own JSON file:
     /// - "{crate_name}.lib.json" (key: "{crate_name}.lib") for lib targets and
     /// - "{crate_name}.bin.json" (key: "{crate_name}.bin") for bin targets.
-    fn load_rustc_argset(&self) -> Result<WorkspaceRustcArgs> {
-        let link_args = std::fs::read_to_string(self.link_args_file())
-            .context("Failed to read link args from file")?
-            .lines()
-            .map(|s| s.to_string())
-            .collect();
+    fn load_rustc_argset(
+        &self,
+        mode: &BuildMode,
+        capture: &LinkCapture,
+    ) -> Result<WorkspaceRustcArgs> {
+        let link_args = if self.dx_links(mode) {
+            let args = std::fs::read_to_string(&capture.args)
+                .context("This build generation did not produce linker arguments")?
+                .lines()
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            ensure!(
+                !args.is_empty(),
+                "This build generation produced an empty linker capture"
+            );
+            args
+        } else {
+            Vec::new()
+        };
 
         let mut workspace_rustc_args = WorkspaceRustcArgs::new(link_args);
 
@@ -2639,16 +2795,8 @@ impl BuildRequest {
         self.main_target.replace('-', "_")
     }
 
-    /// Stderr captured from the linker during the last build. Written by the linker
-    /// interception in `rustcwrapper` and read back to surface warnings/errors to the user.
-    fn link_err_file(&self) -> PathBuf {
-        self.session_cache_dir().join("link_err.txt")
-    }
-
-    /// The linker arguments captured from the tip crate's final link invocation.
-    /// Used to replay the link step during thin (hotpatch) builds.
-    fn link_args_file(&self) -> PathBuf {
-        self.session_cache_dir().join("link_args.json")
+    fn dx_links(&self, mode: &BuildMode) -> bool {
+        self.custom_linker.is_some() || matches!(mode, BuildMode::Thin { .. } | BuildMode::Fat)
     }
 
     /// A response file for MSVC's `link.exe`. Windows command lines have a ~32k character
@@ -3126,11 +3274,10 @@ impl BuildRequest {
             .collect()
     }
 
-    fn cargo_fingerprint_dir(&self) -> PathBuf {
-        self.target_dir
+    fn cargo_profile_dir(&self) -> PathBuf {
+        self.build_dir
             .join(self.triple.to_string())
             .join(&self.profile)
-            .join(".fingerprint")
     }
 
     fn is_apple_target(&self) -> bool {
@@ -3346,4 +3493,93 @@ fn normalize_path(path: &Path) -> PathBuf {
         }
     }
     components.iter().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        sync::mpsc::{RecvTimeoutError, channel},
+        time::Duration,
+    };
+
+    #[test]
+    fn resolves_cargo_build_dir_templates() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("Cargo.toml"), "[workspace]").unwrap();
+        let home = workspace.path().join("cargo-home");
+        let template = Path::new("{workspace-root}/cache/{workspace-path-hash}");
+
+        let resolved = resolve_build_dir(template, workspace.path(), Some(&home)).unwrap();
+        let relative = resolved
+            .strip_prefix(workspace.path().join("cache"))
+            .unwrap();
+        let mut components = relative.components();
+        assert_eq!(components.next().unwrap().as_os_str().len(), 2);
+        assert_eq!(components.next().unwrap().as_os_str().len(), 14);
+        assert!(components.next().is_none());
+
+        let cargo_home = resolve_build_dir(
+            Path::new("{cargo-cache-home}/cache"),
+            workspace.path(),
+            Some(&home),
+        )
+        .unwrap();
+        assert_eq!(cargo_home, home.join("cache"));
+    }
+
+    #[test]
+    fn rejects_unknown_build_dir_template() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("Cargo.toml"), "[workspace]").unwrap();
+        let error = resolve_build_dir(Path::new("{unknown}"), workspace.path(), None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Unsupported template"));
+    }
+
+    #[test]
+    fn build_lock_blocks_fingerprint_invalidation() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile = temp.path().join("wasm-dev");
+        let legacy = profile.join(".fingerprint/render-old");
+        let current = profile.join("build/render/unit/fingerprint");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::create_dir_all(&current).unwrap();
+
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(profile.join(".cargo-build-lock"))
+            .unwrap();
+        FileExt::lock_exclusive(&lock).unwrap();
+
+        let packages = HashSet::from(["render".to_string()]);
+        let (entered_tx, entered_rx) = channel();
+        let (done_tx, done_rx) = channel();
+        let profile = profile.clone();
+        let worker = std::thread::spawn(move || {
+            entered_tx.send(()).unwrap();
+            done_tx
+                .send(invalidate_fingerprints(&profile, &packages))
+                .unwrap();
+        });
+
+        entered_rx.recv().unwrap();
+        assert!(matches!(
+            done_rx.recv_timeout(Duration::from_millis(100)),
+            Err(RecvTimeoutError::Timeout)
+        ));
+        FileExt::unlock(&lock).unwrap();
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        worker.join().unwrap();
+
+        assert!(!legacy.exists());
+        assert!(!current.exists());
+    }
 }

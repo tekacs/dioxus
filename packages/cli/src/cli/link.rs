@@ -1,8 +1,40 @@
 use crate::Result;
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
-use std::{borrow::Cow, ffi::OsString, path::PathBuf, process::ExitCode};
+use std::{
+    borrow::Cow,
+    ffi::OsString,
+    path::{Path, PathBuf},
+    process::ExitCode,
+};
 use target_lexicon::Triple;
+use uuid::Uuid;
+
+pub(crate) struct LinkCapture {
+    pub(crate) args: PathBuf,
+    pub(crate) errors: PathBuf,
+    pub(crate) command: PathBuf,
+}
+
+impl LinkCapture {
+    pub(crate) fn new(session: PathBuf) -> Result<Self> {
+        let capture = session.join("links").join(Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&capture).context("Failed to create linker capture directory")?;
+        Ok(Self::at(capture))
+    }
+
+    pub(crate) fn preview(session: PathBuf) -> Self {
+        Self::at(session.join("link-preview"))
+    }
+
+    fn at(root: PathBuf) -> Self {
+        Self {
+            args: root.join("args.txt"),
+            errors: root.join("errors.txt"),
+            command: root.join("command.txt"),
+        }
+    }
+}
 
 /// `dx` can act as a linker in a few scenarios. Note that we don't *actually* implement the linker logic,
 /// instead just proxying to a specified linker (or not linking at all!).
@@ -89,11 +121,11 @@ impl LinkAction {
         env_vars.push((Self::DX_LINK_ARG.into(), "1".into()));
         env_vars.push((
             Self::DX_ARGS_FILE.into(),
-            dunce::canonicalize(&self.link_args_file)?.into_os_string(),
+            output_path(&self.link_args_file)?.into_os_string(),
         ));
         env_vars.push((
             Self::DX_ERR_FILE.into(),
-            dunce::canonicalize(&self.link_err_file)?.into_os_string(),
+            output_path(&self.link_err_file)?.into_os_string(),
         ));
         env_vars.push((Self::DX_LINK_TRIPLE.into(), self.triple.to_string().into()));
         if let Some(linker) = &self.linker {
@@ -140,9 +172,15 @@ impl LinkAction {
             args.retain(|arg| !arg.ends_with(".lib"));
         }
 
-        // Write the linker args to a file for the main process to read
-        // todo: we might need to encode these as escaped shell words in case newlines are passed
-        std::fs::write(&self.link_args_file, args.join("\n"))?;
+        // Fat/thin linking happens after this linker interception returns. Preserve rustc's
+        // temporary codegen objects under this generation before Cargo can remove or reuse them.
+        if self.linker.is_none() {
+            preserve_inputs(&mut args, &self.link_args_file)?;
+        }
+
+        // Publish only a complete manifest. Each build generation has a distinct path, so an
+        // interrupted or orphaned linker cannot overwrite a replacement generation's capture.
+        write_args(&self.link_args_file, &args)?;
 
         // If there's a linker specified, we use that. Otherwise, we write a dummy object file to satisfy
         // any post-processing steps that rustc does.
@@ -242,7 +280,50 @@ impl LinkAction {
     }
 }
 
-pub fn get_actual_linker_args_excluding_program_name(args: Vec<String>) -> Vec<String> {
+pub fn output_path(path: &Path) -> Result<PathBuf> {
+    let parent = path.parent().context("Linker capture path has no parent")?;
+    std::fs::create_dir_all(parent).context("Failed to create linker capture directory")?;
+    let parent =
+        dunce::canonicalize(parent).context("Failed to resolve linker capture directory")?;
+    let name = path
+        .file_name()
+        .context("Linker capture path has no file name")?;
+    Ok(parent.join(name))
+}
+
+fn preserve_inputs(args: &mut [String], manifest: &Path) -> Result<()> {
+    let root = manifest
+        .parent()
+        .context("Linker capture path has no parent")?
+        .join("inputs");
+
+    for (index, arg) in args.iter_mut().enumerate() {
+        if !arg.ends_with(".rcgu.o") {
+            continue;
+        }
+
+        let source = Path::new(arg);
+        let name = source
+            .file_name()
+            .context("Linker input has no file name")?;
+        std::fs::create_dir_all(&root).context("Failed to create linker input directory")?;
+        let owned = root.join(format!("{index}-{}", name.to_string_lossy()));
+        std::fs::copy(source, &owned)
+            .with_context(|| format!("Failed to preserve linker input {}", source.display()))?;
+        *arg = owned.to_string_lossy().into_owned();
+    }
+
+    Ok(())
+}
+
+fn write_args(path: &Path, args: &[String]) -> Result<()> {
+    let pending = path.with_extension("pending");
+    std::fs::write(&pending, args.join("\n")).context("Failed to write linker capture")?;
+    _ = std::fs::remove_file(path);
+    std::fs::rename(pending, path).context("Failed to publish linker capture")
+}
+
+fn get_actual_linker_args_excluding_program_name(args: Vec<String>) -> Vec<String> {
     args.into_iter()
         .skip(1) // the first arg is program name
         .flat_map(|arg| handle_linker_arg_response_file(arg).into_iter())
@@ -284,5 +365,29 @@ pub fn handle_linker_arg_response_file(arg: String) -> Vec<String> {
             .collect()
     } else {
         vec![arg]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preserves_generation_inputs() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("render.rcgu.o");
+        std::fs::write(&source, b"object").unwrap();
+        let manifest = temp.path().join("capture/args.txt");
+        std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        let untouched = "libdependency.rlib".to_string();
+        let mut args = vec![source.display().to_string(), untouched.clone()];
+
+        preserve_inputs(&mut args, &manifest).unwrap();
+        write_args(&manifest, &args).unwrap();
+        std::fs::remove_file(source).unwrap();
+
+        assert_eq!(std::fs::read(&args[0]).unwrap(), b"object");
+        assert_eq!(args[1], untouched);
+        assert_eq!(std::fs::read_to_string(manifest).unwrap(), args.join("\n"));
     }
 }
