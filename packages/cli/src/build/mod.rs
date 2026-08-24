@@ -11,6 +11,7 @@
 // Platform-specific build code
 mod android;
 mod apple;
+mod artifacts;
 mod web;
 mod windows;
 

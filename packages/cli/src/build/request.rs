@@ -1090,58 +1090,72 @@ impl BuildRequest {
     }
 
     pub(crate) async fn build(&self, ctx: BuildContext) -> Result<BuildArtifacts> {
-        match &ctx.mode {
-            // In hotpatch mode, we use the dedicated hotpatch flow
-            BuildMode::Thin { .. } => self.compile_workspace_hotpatch(&ctx).await,
+        let marker = self.build_dir.join(".dx-artifacts").join(format!(
+            "{}-{}-{}-{}.json",
+            self.main_target, self.triple, self.profile, ctx.build_id.0
+        ));
+        let target = self
+            .target_dir
+            .join(self.triple.to_string())
+            .join(&self.profile);
+        let custody = super::artifacts::Artifacts::start(marker, self.cargo_profile_dir(), target)?;
+        let result = async {
+            match &ctx.mode {
+                // In hotpatch mode, we use the dedicated hotpatch flow
+                BuildMode::Thin { .. } => self.compile_workspace_hotpatch(&ctx).await,
 
-            // In base/fat mode, we do the full chain with a root `cargo rustc`
-            BuildMode::Base | BuildMode::Fat => {
-                let mut artifacts = self.cargo_build(&ctx).await?;
+                // In base/fat mode, we do the full chain with a root `cargo rustc`
+                BuildMode::Base | BuildMode::Fat => {
+                    let mut artifacts = self.cargo_build(&ctx).await?;
 
-                ctx.profile_phase("Post-processing executable");
-                self.post_process_executable(&artifacts).await?;
+                    ctx.profile_phase("Post-processing executable");
+                    self.post_process_executable(&artifacts).await?;
 
-                ctx.profile_phase("Writing executable");
-                self.write_executable(&ctx, &mut artifacts)
-                    .await
-                    .context("Failed to write executable")?;
+                    ctx.profile_phase("Writing executable");
+                    self.write_executable(&ctx, &mut artifacts)
+                        .await
+                        .context("Failed to write executable")?;
 
-                ctx.profile_phase("Writing frameworks");
-                self.write_frameworks(&artifacts)
-                    .await
-                    .context("Failed to write frameworks")?;
+                    ctx.profile_phase("Writing frameworks");
+                    self.write_frameworks(&artifacts)
+                        .await
+                        .context("Failed to write frameworks")?;
 
-                ctx.profile_phase("Writing assets");
-                self.write_assets(&ctx, &artifacts.assets)
-                    .await
-                    .context("Failed to write assets")?;
+                    ctx.profile_phase("Writing assets");
+                    self.write_assets(&ctx, &artifacts.assets)
+                        .await
+                        .context("Failed to write assets")?;
 
-                ctx.profile_phase("Writing metadata");
-                self.write_metadata()
-                    .await
-                    .context("Failed to write metadata")?;
+                    ctx.profile_phase("Writing metadata");
+                    self.write_metadata()
+                        .await
+                        .context("Failed to write metadata")?;
 
-                ctx.profile_phase("Writing ffi");
-                self.write_ffi_plugins(&ctx, &artifacts).await?;
+                    ctx.profile_phase("Writing ffi");
+                    self.write_ffi_plugins(&ctx, &artifacts).await?;
 
-                ctx.profile_phase("Running optimizer");
-                self.optimize(&ctx)
-                    .await
-                    .context("Failed to optimize build")?;
+                    ctx.profile_phase("Running optimizer");
+                    self.optimize(&ctx)
+                        .await
+                        .context("Failed to optimize build")?;
 
-                ctx.profile_phase("Running assemble");
-                self.assemble(&ctx)
-                    .await
-                    .context("Failed to assemble build")?;
+                    ctx.profile_phase("Running assemble");
+                    self.assemble(&ctx)
+                        .await
+                        .context("Failed to assemble build")?;
 
-                ctx.profile_phase("Populating cache");
-                self.fill_caches(&ctx, &mut artifacts).await?;
+                    ctx.profile_phase("Populating cache");
+                    self.fill_caches(&ctx, &mut artifacts).await?;
 
-                tracing::debug!("Bundle created at {}", self.root_dir().display());
+                    tracing::debug!("Bundle created at {}", self.root_dir().display());
 
-                Ok(artifacts)
+                    Ok(artifacts)
+                }
             }
         }
+        .await;
+        custody.finish()?;
+        result
     }
 
     /// Run the cargo build by assembling the build command and executing it.

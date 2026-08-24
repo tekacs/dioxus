@@ -39,6 +39,42 @@ use target_lexicon::{Architecture, OperatingSystem};
 use tokio::{io::AsyncBufReadExt, process::Command};
 use uuid::Uuid;
 
+#[derive(serde::Deserialize, Serialize)]
+struct FatArchiveReceipt {
+    version: u8,
+    archive_len: u64,
+    compiler_rlibs: Vec<PathBuf>,
+}
+
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path.parent().context("fat-link cache path has no parent")?;
+    std::fs::create_dir_all(parent).context("Failed to create fat-link cache directory")?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .context("Failed to create temporary fat-link cache")?;
+    std::io::Write::write_all(&mut temporary, bytes)
+        .and_then(|()| temporary.as_file().sync_all())
+        .context("Failed to write temporary fat-link cache")?;
+    temporary
+        .persist(path)
+        .map_err(|error| error.error)
+        .context("Failed to publish fat-link cache")?;
+    #[cfg(unix)]
+    std::fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .context("Failed to sync fat-link cache directory")?;
+    Ok(())
+}
+
+fn load_fat_receipt(receipt: &Path, archive: &Path) -> Option<FatArchiveReceipt> {
+    let receipt = std::fs::read(receipt).ok()?;
+    let receipt = serde_json::from_slice::<FatArchiveReceipt>(&receipt).ok()?;
+    (receipt.version == 1
+        && archive
+            .metadata()
+            .is_ok_and(|metadata| metadata.len() == receipt.archive_len))
+    .then_some(receipt)
+}
+
 impl BuildRequest {
     /// We're going to create a DAG of modified crates, replay their rustc commands directly, and then
     /// manually link at the end.
@@ -291,6 +327,7 @@ impl BuildRequest {
             .args(out_args)
             .env_clear()
             .envs(command_envs)
+            .kill_on_drop(true)
             .output()
             .await?;
 
@@ -597,6 +634,7 @@ impl BuildRequest {
         let mut child = cmd
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .kill_on_drop(true)
             .spawn()
             .context("Failed to spawn rustc replay")?;
 
@@ -987,15 +1025,20 @@ impl BuildRequest {
             &Uuid::NAMESPACE_OID,
             rlibs
                 .iter()
-                .map(|p| {
+                .map(|path| {
+                    let metadata = path.metadata();
                     format!(
                         "{}-{}-{}-{}",
-                        p.file_name().unwrap().to_string_lossy(),
-                        p.metadata().map(|m| m.len()).unwrap_or_default(),
-                        p.metadata()
+                        path.display(),
+                        metadata
+                            .as_ref()
+                            .map(|metadata| metadata.len())
+                            .unwrap_or_default(),
+                        metadata
                             .ok()
-                            .and_then(|m| m.modified().ok())
-                            .and_then(|f| f.duration_since(UNIX_EPOCH).map(|f| f.as_secs()).ok())
+                            .and_then(|metadata| metadata.modified().ok())
+                            .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+                            .map(|modified| modified.as_nanos())
                             .unwrap_or_default(),
                         crate::dx_build_info::GIT_COMMIT_HASH.unwrap_or_default()
                     )
@@ -1003,24 +1046,18 @@ impl BuildRequest {
                 .collect::<String>()
                 .as_bytes(),
         )
-        .to_string()
-        .chars()
-        .take(8)
-        .collect::<String>();
+        .simple()
+        .to_string();
 
-        // Check if we already have a cached object file
-        let out_ar_path = exe.with_file_name(format!("libdeps-{hash_id}.a",));
-        let out_rlibs_list = exe.with_file_name(format!("rlibs-{hash_id}.txt"));
-        // The rlib list is the archive's completion receipt. A failed link can leave the
-        // archive behind before that receipt is written; reusing it would silently omit
-        // every compiler rlib, including core and alloc.
-        let cache_complete = out_ar_path.exists() && out_rlibs_list.exists();
+        // The full input identity names one immutable cache generation. The
+        // receipt is published only after the final linker accepts that archive.
+        let out_ar_path = exe.with_file_name(format!("libdeps-{hash_id}.a"));
+        let out_receipt = exe.with_file_name(format!("libdeps-{hash_id}.json"));
+        let receipt = load_fat_receipt(&out_receipt, &out_ar_path);
+        let cache_complete = receipt.is_some();
         let mut archive_has_contents = cache_complete;
-
-        // Use the rlibs list if it exists
-        let mut compiler_rlibs = std::fs::read_to_string(&out_rlibs_list)
-            .ok()
-            .map(|s| s.lines().map(PathBuf::from).collect::<Vec<_>>())
+        let mut compiler_rlibs = receipt
+            .map(|receipt| receipt.compiler_rlibs)
             .unwrap_or_default();
 
         // Create it by dumping all the rlibs into it
@@ -1091,7 +1128,7 @@ impl BuildRequest {
             }
 
             let bytes = out_ar.into_inner().context("Failed to finalize archive")?;
-            std::fs::write(&out_ar_path, bytes).context("Failed to write archive")?;
+            write_atomic(&out_ar_path, &bytes)?;
             tracing::debug!("Wrote fat archive to {:?}", out_ar_path);
 
             // Run the ranlib command to index the archive. This slows down this process a bit,
@@ -1099,7 +1136,11 @@ impl BuildRequest {
             // We ignore its error in case it doesn't recognize the architecture
             if self.linker_flavor() == LinkerFlavor::Darwin {
                 if let Some(ranlib) = Workspace::select_ranlib() {
-                    _ = Command::new(ranlib).arg(&out_ar_path).output().await;
+                    _ = Command::new(ranlib)
+                        .arg(&out_ar_path)
+                        .kill_on_drop(true)
+                        .output()
+                        .await;
                 }
             }
         }
@@ -1258,6 +1299,7 @@ impl BuildRequest {
             .args(out_args)
             .env_clear()
             .envs(command_envs)
+            .kill_on_drop(true)
             .output()
             .await?;
 
@@ -1294,14 +1336,16 @@ impl BuildRequest {
             _ = std::fs::remove_file(f);
         }
 
-        // Cache the rlibs list
-        _ = std::fs::write(
-            &out_rlibs_list,
-            compiler_rlibs
-                .into_iter()
-                .map(|s| s.display().to_string())
-                .join("\n"),
-        );
+        let receipt = FatArchiveReceipt {
+            version: 1,
+            archive_len: out_ar_path
+                .metadata()
+                .context("Failed to stat completed fat archive")?
+                .len(),
+            compiler_rlibs,
+        };
+        let receipt = serde_json::to_vec(&receipt).context("Failed to encode fat-link receipt")?;
+        write_atomic(&out_receipt, &receipt)?;
 
         tracing::debug!(
             "Fat linking completed in {}us",
@@ -1756,4 +1800,40 @@ fn dep_info_path_for_rustc_args(args: &[String]) -> Option<PathBuf> {
     let out_dir = out_dir?;
     let crate_name = crate_name?;
     Some(PathBuf::from(out_dir).join(format!("{crate_name}{extra}.d")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fat_archive_receipt_requires_the_published_archive_length() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = root.path().join("libdeps.a");
+        let receipt = root.path().join("libdeps.json");
+        write_atomic(&archive, b"complete").unwrap();
+        write_atomic(
+            &receipt,
+            &serde_json::to_vec(&FatArchiveReceipt {
+                version: 1,
+                archive_len: 8,
+                compiler_rlibs: vec![PathBuf::from("libcore.rlib")],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(load_fat_receipt(&receipt, &archive).is_some());
+
+        std::fs::write(&archive, b"partial").unwrap();
+        assert!(load_fat_receipt(&receipt, &archive).is_none());
+    }
+
+    #[test]
+    fn atomic_cache_publication_replaces_the_complete_file() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("cache");
+        write_atomic(&path, b"first").unwrap();
+        write_atomic(&path, b"second").unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), b"second");
+    }
 }

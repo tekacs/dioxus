@@ -6,6 +6,7 @@ use crate::{
 };
 
 mod ansi_buffer;
+mod build_state;
 mod output;
 mod proxy;
 mod proxy_ws;
@@ -50,6 +51,7 @@ pub(crate) async fn serve_all(args: ServeArgs, tracer: &TraceController) -> Resu
     // Load the args into a plan, resolving all tooling, build dirs, arguments, decoding the multi-target, etc
     let exit_on_error = args.exit_on_error;
     let mut builder = AppServer::new(args).await?;
+    let mut build_state = build_state::Journal::from_env()?;
     let mut devserver = WebServer::start(&builder)?;
     let mut screen = Output::start(builder.interactive).await?;
 
@@ -151,6 +153,7 @@ pub(crate) async fn serve_all(args: ServeArgs, tracer: &TraceController) -> Resu
             }
 
             ServeLoopUpdate::Serve(ServeUpdate::RequestRebuild) => {
+                build_state.begin_manual()?;
                 // The spacing here is important-ish: we want
                 // `Full rebuild:` to line up with
                 // `Hotreloading:` to keep the alignment during long edit sessions
@@ -224,6 +227,9 @@ pub(crate) async fn serve_all(args: ServeArgs, tracer: &TraceController) -> Resu
                         screen.push_cargo_log(message);
                     }
                     BuilderUpdate::BuildFailed { err } => {
+                        if id == BuildId::PRIMARY {
+                            build_state.failed(err.to_string())?;
+                        }
                         tracing::error!(
                             "{ERROR_STYLE}Build failed{ERROR_STYLE:#}: {}",
                             crate::error::log_stacktrace(&err, 0),
@@ -266,10 +272,16 @@ pub(crate) async fn serve_all(args: ServeArgs, tracer: &TraceController) -> Resu
                             }
                         }
                         BuildMode::Base { .. } | BuildMode::Fat => {
-                            _ = builder
-                                .open(&bundle, &mut devserver)
-                                .await
-                                .inspect_err(|e| tracing::error!("Failed to open app: {}", e));
+                            let opened = builder.open(&bundle, &mut devserver).await;
+                            if id == BuildId::PRIMARY {
+                                match &opened {
+                                    Ok(()) => build_state.served()?,
+                                    Err(error) => build_state.failed(error.to_string())?,
+                                }
+                            }
+                            if let Err(error) = opened {
+                                tracing::error!("Failed to open app: {}", error);
+                            }
                             process_pending_changes(&mut builder, &mut devserver).await;
                         }
                     },
@@ -354,6 +366,7 @@ pub(crate) async fn serve_all(args: ServeArgs, tracer: &TraceController) -> Resu
             }
 
             ServeLoopUpdate::Serve(ServeUpdate::Exit { error }) => {
+                build_state.exited()?;
                 _ = builder.shutdown().await;
                 _ = devserver.shutdown().await;
 
