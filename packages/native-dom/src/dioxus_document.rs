@@ -2,9 +2,9 @@
 use crate::NodeId;
 use crate::events::{
     BlitzKeyboardData, NativeConverter, NativeFocusData, NativeFormData, NativePointerData,
-    NativeScrollData, NativeWheelData, NodeHandle,
+    NativeScrollData, NativeTouchData, NativeWheelData, NodeHandle,
 };
-use crate::mutation_writer::{DioxusState, MutationWriter};
+use crate::mutation_writer::DioxusState;
 use crate::qual_name;
 use blitz_dom::{
     Attribute, BaseDocument, DEFAULT_CSS, DocGuard, DocGuardMut, Document, DocumentConfig,
@@ -33,7 +33,7 @@ fn get_dioxus_id(node: &Node) -> Option<ElementId> {
         .iter()
         .find(|attr| *attr.name.local == *"data-dioxus-id")
         .and_then(|attr| attr.value.parse::<usize>().ok())
-        .map(ElementId)
+        .map(ElementId::from_raw)
 }
 
 /// Integrates [`BaseDocument`] from  [`blitz-dom`](blitz_dom)  with [`VirtualDom`] from [`dioxus-core`](dioxus_core)
@@ -145,7 +145,7 @@ impl DioxusDocument {
     /// Run an initial build of the Dioxus vdom
     pub fn initial_build(&mut self) {
         let mut inner = self.inner.borrow_mut();
-        let mut writer = MutationWriter::new(&mut inner, &mut self.vdom_state);
+        let mut writer = self.vdom_state.writer(&mut inner);
         self.vdom.rebuild(&mut writer);
         drop(writer);
         drop(inner);
@@ -231,7 +231,7 @@ impl Document for DioxusDocument {
         }
 
         let mut inner = self.inner.borrow_mut();
-        let mut writer = MutationWriter::new(&mut inner, &mut self.vdom_state);
+        let mut writer = self.vdom_state.writer(&mut inner);
         self.vdom.render_immediate(&mut writer);
         drop(writer);
         drop(inner);
@@ -258,7 +258,7 @@ pub struct DioxusEventHandler<'v> {
 impl EventHandler for DioxusEventHandler<'_> {
     fn handle_event(
         &mut self,
-        chain: &[usize],
+        chain: &[NodeId],
         event: &mut DomEvent,
         doc: &mut dyn Document,
         event_state: &mut EventState,
@@ -275,6 +275,7 @@ impl EventHandler for DioxusEventHandler<'_> {
             DomEventData::PointerMove(mevent)
             | DomEventData::PointerDown(mevent)
             | DomEventData::PointerUp(mevent)
+            | DomEventData::PointerCancel(mevent)
             | DomEventData::PointerLeave(mevent)
             | DomEventData::PointerEnter(mevent)
             | DomEventData::PointerOver(mevent)
@@ -290,6 +291,13 @@ impl EventHandler for DioxusEventHandler<'_> {
             | DomEventData::ContextMenu(mevent)
             | DomEventData::DoubleClick(mevent) => {
                 Some(wrap_event_data(NativePointerData(mevent.clone())))
+            }
+
+            DomEventData::TouchStart(tevent)
+            | DomEventData::TouchMove(tevent)
+            | DomEventData::TouchEnd(tevent)
+            | DomEventData::TouchCancel(tevent) => {
+                Some(wrap_event_data(NativeTouchData(tevent.clone())))
             }
 
             DomEventData::Scroll(sevent) => Some(wrap_event_data(NativeScrollData(sevent.clone()))),
@@ -322,27 +330,26 @@ impl EventHandler for DioxusEventHandler<'_> {
             return;
         };
 
-        for &node_id in chain {
-            // Get dioxus vdom id for node
-            let dioxus_id = doc.inner().get_node(node_id).and_then(get_dioxus_id);
-            let Some(id) = dioxus_id else {
-                continue;
-            };
+        // Get dioxus vdom id for node
+        let dioxus_id = chain
+            .iter()
+            .find_map(|node_id| doc.inner().get_node(*node_id).and_then(get_dioxus_id));
+        let Some(id) = dioxus_id else {
+            return;
+        };
 
-            // Handle event in vdom
-            let dx_event = Event::new(event_data.clone(), event.bubbles);
-            self.vdom
-                .runtime()
-                .handle_event(event.name(), dx_event.clone(), id);
+        // Handle event in vdom
+        let dx_event = Event::new(event_data.clone(), event.bubbles);
+        self.vdom
+            .runtime()
+            .handle_event(event.name(), dx_event.clone(), id);
 
-            // Update event state
-            if !dx_event.default_action_enabled() {
-                event_state.prevent_default();
-            }
-            if !dx_event.propagates() {
-                event_state.stop_propagation();
-                break;
-            }
+        // Update event state
+        if !dx_event.default_action_enabled() {
+            event_state.prevent_default();
+        }
+        if !dx_event.propagates() {
+            event_state.stop_propagation();
         }
     }
 }

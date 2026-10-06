@@ -7,6 +7,7 @@ use crate::{
 
 mod ansi_buffer;
 mod build_state;
+mod files;
 mod output;
 mod proxy;
 mod proxy_ws;

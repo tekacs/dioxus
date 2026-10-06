@@ -416,6 +416,13 @@ pub fn create_windows_jump_table(patch: &Path, cache: &HotpatchModuleCache) -> R
         }
     }
 
+    tracing::debug!(
+        "Windows jump table: {} of {} patch symbols matched against {} symbols in the running binary",
+        map.len(),
+        new_name_to_addr.len(),
+        old_name_to_addr.len()
+    );
+
     let new_base_address = new_name_to_addr
         .get("main")
         .cloned()
@@ -1010,10 +1017,7 @@ fn trap_func(module: &mut Module, func_id: FunctionId) {
     }
     builder.func_body().unreachable();
 
-    let locals = params
-        .iter()
-        .map(|ty| module.locals.add(*ty))
-        .collect();
+    let locals = params.iter().map(|ty| module.locals.add(*ty)).collect();
     module.funcs.get_mut(func_id).kind = FunctionKind::Local(builder.local_func(locals));
 }
 
@@ -1683,7 +1687,7 @@ pub fn stub_wasm_env_imports(bytes: &[u8]) -> Result<Vec<u8>> {
             }
         }
         ElementItems::Expressions(ref_type, exprs) => {
-            if *ref_type != RefType::Funcref {
+            if *ref_type != RefType::FUNCREF {
                 return Err(PatchError::InvalidModule(
                     "Expected ifunc table to be a funcref table".into(),
                 ));
@@ -1917,7 +1921,7 @@ pub fn finalize_wasm_base_module(
             }
         }
         ElementItems::Expressions(ref_type, exprs) => {
-            if *ref_type != RefType::Funcref {
+            if *ref_type != RefType::FUNCREF {
                 return Err(PatchError::InvalidModule(
                     "Expected ifunc table to be a funcref table".into(),
                 ));
@@ -2057,8 +2061,7 @@ fn wbg_cast_symbol_catch() {
 fn trap_func_validates_mismatched_signature() {
     let mut module = Module::default();
     let params = [walrus::ValType::I32, walrus::ValType::I32];
-    let mut builder =
-        FunctionBuilder::new(&mut module.types, &params, &[walrus::ValType::I32]);
+    let mut builder = FunctionBuilder::new(&mut module.types, &params, &[walrus::ValType::I32]);
     let locals = params
         .iter()
         .map(|ty| module.locals.add(*ty))

@@ -282,7 +282,12 @@ impl WebServer {
                     Some(Ok(msg)) => return ServeUpdate::WsMessage { msg, bundle: BundleFormat::Web },
                     _ => {
                         drop(new_message);
-                        _ = self.hot_reload_sockets.remove(idx);
+                        let socket = self.hot_reload_sockets.remove(idx);
+                        tracing::warn!(
+                            "Devtools websocket disconnected (build_id: {:?}, pid: {:?}) - this client will no longer receive hot-reloads or hot-patches",
+                            socket.build_id,
+                            socket.pid
+                        );
                     }
                 }
             }
@@ -420,6 +425,19 @@ impl WebServer {
         build: BuildId,
         for_pid: Option<u32>,
     ) {
+        if jump_table.map.is_empty() {
+            tracing::warn!(
+                "Hot-patch jump table for {build:?} is empty - the patch will have no effect. \
+                This usually means no symbols in the patch matched the running binary."
+            );
+        } else {
+            tracing::debug!(
+                "Sending hot-patch for {build:?} with {} jump table entries to {} connected client(s)",
+                jump_table.map.len(),
+                self.hot_reload_sockets.len()
+            );
+        }
+
         let msg = DevserverMsg::HotReload(HotReloadMsg {
             jump_table: Some(jump_table),
             ms_elapsed: time_taken.as_millis() as u64,
@@ -472,8 +490,9 @@ impl WebServer {
             let send_result =
                 tokio::time::timeout(Self::WS_SEND_TIMEOUT, socket.socket.send(msg.clone())).await;
 
-            if !send_result.is_ok_and(|result| result.is_ok()) {
-                tracing::debug!("Dropping stale devserver socket after send timeout/error");
+            if !send_result.as_ref().is_ok_and(|result| result.is_ok()) {
+                tracing::warn!(build_id = ?socket.build_id, pid = ?socket.pid, result = ?send_result,
+                    "Dropping stale devserver socket after send timeout/error");
                 self.hot_reload_sockets.remove(i);
             } else {
                 i += 1;

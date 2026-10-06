@@ -15,10 +15,11 @@ default = ["accessibility", "svg", "system-fonts"]
 # DOM features
 svg = ["blitz-dom/svg"]
 floats = ["blitz-dom/floats"]
-incremental = ["blitz-dom/incremental"]
 accessibility = ["blitz-dom/accessibility"]
 tracing = ["dep:tracing", "blitz-dom/tracing"]
-system-fonts = ["blitz-dom/system_fonts"]
+system-fonts = ["blitz-dom/system-fonts"]
+# complex-scripts: enable dictionary-based line-breaking
+complex-scripts = ["blitz-dom/complex-scripts"]
 autofocus = ["blitz-dom/autofocus"]
 
 [dependencies]

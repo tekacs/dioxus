@@ -12,6 +12,7 @@ rust-version = "1.85.0"
 
 [dependencies]
 dioxus-core = { workspace = true, features = ["serialize"] }
+dioxus-core-macro = { workspace = true }
 dioxus-html = { workspace = true, features = ["serialize"] }
 dioxus-document = { workspace = true }
 dioxus-signals = { workspace = true, optional = true }
@@ -100,6 +101,10 @@ fullscreen = ["wry/fullscreen"]
 devtools = ["wry/devtools", "dep:dioxus-devtools", "dioxus-signals"]
 transparent = ["wry/transparent"]
 gnu = []
+# Links `libxdo.so` on Linux, required only for the predefined Copy, Cut, Paste
+# and SelectAll menu items. Off by default so apps that do not use them are not
+# tied to the build machine's libxdo soname. Mirrors Tauri's `linux-libxdo`.
+linux-libxdo = ["muda/libxdo", "tray-icon/libxdo"]
 
 [package.metadata.docs.rs]
 features = ["tokio_runtime", "devtools"]
@@ -141,4 +146,9 @@ harness = false
 [[test]]
 name = "check_eval"
 path = "headless_tests/eval.rs"
+harness = false
+
+[[test]]
+name = "check_multiwindow"
+path = "headless_tests/multiwindow.rs"
 harness = false
