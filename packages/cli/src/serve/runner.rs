@@ -1,4 +1,4 @@
-use super::{AppBuilder, ServeUpdate, WebServer};
+use super::{AppBuilder, ServeUpdate, WebServer, files};
 use crate::{
     BuildArtifacts, BuildId, BuildMode, BuildRequest, BuildTargets, BuilderUpdate, BundleFormat,
     HotpatchModuleCache, Result, ServeArgs, TailwindCli, TraceSrc, Workspace,
@@ -14,7 +14,6 @@ use dioxus_html::HtmlCtx;
 use dioxus_rsx::CallBody;
 use dioxus_rsx_hotreload::{ChangedRsx, HotReloadResult};
 use futures_channel::mpsc::{UnboundedReceiver, UnboundedSender};
-use futures_util::StreamExt;
 use futures_util::future::OptionFuture;
 use krates::NodeId;
 use notify::{
@@ -349,7 +348,7 @@ impl AppServer {
 
         let client_wait = client.wait();
         let server_wait = OptionFuture::from(server.map(|s| s.wait()));
-        let watcher_wait = self.watcher_rx.next();
+        let watcher_wait = files::next(&mut self.watcher_rx);
 
         tokio::select! {
             // Wait for the client to finish
@@ -368,52 +367,7 @@ impl AppServer {
             }
 
             // Wait for the watcher to send us an event
-            event = watcher_wait => {
-                let mut changes: Vec<_> = event.into_iter().collect();
-
-                // Dequeue in bulk if we can, we might've received a lot of events in one go
-                while let Ok(event) = self.watcher_rx.try_recv() {
-                    changes.push(event);
-                }
-
-                // Filter the changes
-                let mut files: Vec<PathBuf> = vec![];
-                let mut deferred_zero_len_files: Vec<PathBuf> = vec![];
-
-                // Decompose the events into a list of all the files that have changed
-                for event in changes.drain(..) {
-                    // Make sure we add new folders to the watch list, provided they're not matched by the ignore list
-                    // We'll only watch new folders that are found under the crate, and then update our watcher to watch them
-                    // This unfortunately won't pick up new krates added "at a distance" - IE krates not within the workspace.
-                    if let EventKind::Create(_create_kind) = event.kind {
-                        // If it's a new folder, watch it
-                        // If it's a new cargo.toml (ie dep on the fly),
-                        // todo(jon) support new folders on the fly
-                    }
-
-                    for path in event.paths {
-                        // Some editors and tools can emit an event while a file is transiently empty
-                        // (truncate + write). Defer these paths and check them again shortly.
-                        match std::fs::metadata(&path) {
-                            Ok(metadata) if metadata.is_file() && metadata.len() == 0 => {
-                                deferred_zero_len_files.push(path);
-                                continue;
-                            }
-                            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                                deferred_zero_len_files.push(path);
-                                continue;
-                            }
-                            _ => {}
-                        }
-
-                        files.push(path);
-                    }
-                }
-
-                if !deferred_zero_len_files.is_empty() {
-                    tokio::time::sleep(Duration::from_millis(25)).await;
-                    files.extend(deferred_zero_len_files);
-                }
+            mut files = watcher_wait => {
 
                 // Check for the stdin-watch "force rebuild" sentinel.
                 // If present alongside real file changes, queue them as pending
@@ -462,6 +416,10 @@ impl AppServer {
             self.pending_file_changes.extend(files.iter().cloned());
             return;
         }
+
+        // This handler owns the batch: unlike wait(), it is not a select branch
+        // that can be cancelled by an unrelated log, websocket or terminal event.
+        files::settle(files).await;
 
         // If we have any changes to the rust files, we need to update the file map
         let mut templates = vec![];

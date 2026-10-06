@@ -17,6 +17,7 @@ mod windows;
 
 mod assets;
 mod builder;
+mod cascade;
 mod context;
 mod link;
 mod patch;

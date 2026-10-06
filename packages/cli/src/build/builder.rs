@@ -353,8 +353,8 @@ impl AppBuilder {
     /// the latest version of *every* crate modified since the fat build, not just the one that
     /// changed this iteration. We BFS `workspace_dependents_of` from `changed_crates` to catch
     /// the cascade — e.g. editing a leaf crate forces parent crates' generic instantiations to
-    /// change too. (`compile_workspace_deps` does its own walk to decide what to *compile* now;
-    /// this set tracks what to *link* into the patch.)
+    /// change too. Only crates in the tip's dependency closure participate; sibling consumers
+    /// have no objects in this build and must not enter replay.
     ///
     /// Then aborts any in-flight build and spawns a fresh task with [`BuildMode::Thin`], handing
     /// it the fat build's `workspace_rustc_args`/`artifact_paths` (so rustc gets re-invoked with
@@ -402,28 +402,15 @@ impl AppBuilder {
         // Pre-compute the cumulative modified_crates set. Every patch includes objects from
         // ALL crates modified since the fat build. We compute the full cascade closure here
         // (while we have &mut self) so it doesn't need to be round-tripped through BuildArtifacts.
-        //
-        // Note: compile_workspace_deps() independently computes which crates to compile for THIS
-        // patch (starting from changed_crates + cascade). That serves a different purpose — it only
-        // compiles what changed now, not everything ever modified. Both use workspace_dependents_of
-        // for the BFS, so they stay in sync automatically.
-        let tip_crate_name = self.build.main_target.replace('-', "_");
-        self.modified_crates.insert(tip_crate_name.clone());
-
-        // Add changed crates and their transitive workspace dependents (cascade).
-        let mut to_visit: Vec<String> = changed_crates.clone();
-        let mut visited = HashSet::new();
-        while let Some(c) = to_visit.pop() {
-            if !visited.insert(c.clone()) {
-                continue;
-            }
-            self.modified_crates.insert(c.clone());
-            for dep in self.build.workspace_dependents_of(&c) {
-                if dep != tip_crate_name && !visited.contains(&dep) {
-                    to_visit.push(dep);
-                }
-            }
-        }
+        let tip = self.build.main_target.replace('-', "_");
+        let mut allowed: HashSet<String> =
+            self.build.workspace_crate_dep_names().into_iter().collect();
+        allowed.insert(tip.clone());
+        let changed = changed_crates.iter().cloned().chain(std::iter::once(tip));
+        self.modified_crates
+            .extend(super::cascade::cascade(changed, &allowed, |name| {
+                self.build.workspace_dependents_of(name)
+            }));
 
         tracing::debug!(
             "Patch rebuild: changed_crates={:?}, modified_crates={:?}",

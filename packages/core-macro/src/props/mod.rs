@@ -1029,7 +1029,7 @@ Finally, call `.build()` to create the instance of `{name}`.
                 let name_str = path_to_single_string(path).unwrap();
                 let camel_name = name_str.to_case(Case::UpperCamel);
                 let marker_name = Ident::new(
-                    format!("{}Extension", &camel_name).as_str(),
+                    format!("{}Extension", camel_name).as_str(),
                     path.span(),
                 );
                 quote! {

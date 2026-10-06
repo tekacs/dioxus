@@ -38,7 +38,7 @@ impl ToTokens for ImplExtensionAttributes {
             .strip_prefix("r#")
             .unwrap_or(&name_string)
             .to_case(Case::UpperCamel);
-        let extension_name = Ident::new(format!("{}Extension", &camel_name).as_str(), name.span());
+        let extension_name = Ident::new(format!("{}Extension", camel_name).as_str(), name.span());
 
         let impls = self.attrs.iter().map(|ident| {
             let d = quote! { #name::#ident };

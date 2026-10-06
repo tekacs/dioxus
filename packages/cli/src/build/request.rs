@@ -3303,7 +3303,7 @@ impl BuildRequest {
 
     /// All workspace crate names that the tip crate transitively depends on
     /// (underscore-normalized, excluding the tip itself).
-    fn workspace_crate_dep_names(&self) -> Vec<String> {
+    pub(super) fn workspace_crate_dep_names(&self) -> Vec<String> {
         let krates = &self.workspace.krates;
 
         let workspace_names: HashSet<String> = krates
