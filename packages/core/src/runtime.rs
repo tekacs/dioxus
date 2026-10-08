@@ -17,7 +17,7 @@ use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::{
     cell::{Cell, Ref, RefCell},
-    rc::Rc,
+    rc::{Rc, Weak},
 };
 use tracing::instrument;
 
@@ -25,6 +25,8 @@ use dioxus_core_template::TemplatePath;
 
 thread_local! {
     static RUNTIMES: RefCell<Vec<Rc<Runtime>>> = const { RefCell::new(vec![]) };
+    // The thread's single application, consulted only when no runtime is entered.
+    static DEFAULT: RefCell<Weak<Runtime>> = const { RefCell::new(Weak::new()) };
 }
 
 /// A global runtime that is shared across all scopes that provides the async runtime and context API
@@ -112,11 +114,9 @@ impl Runtime {
 
     /// Get the current runtime
     pub fn current() -> Rc<Self> {
-        RUNTIMES
-            .with(|stack| stack.borrow().last().cloned())
-            .unwrap_or_else(|| {
-                panic!(
-                    "Must be called from inside a Dioxus runtime.
+        Self::try_current().unwrap_or_else(|| {
+            panic!(
+                "Must be called from inside a Dioxus runtime.
 
 Help: Some APIs in dioxus require a global runtime to be present.
 If you are calling one of these APIs from outside of a dioxus runtime
@@ -146,13 +146,29 @@ fn MyComponent() -> Element {{
     }})
 }}
 ```"
-                )
-            })
+            )
+        })
     }
 
     /// Try to get the current runtime, returning None if it doesn't exist (outside the context of a dioxus app)
+    ///
+    /// An entered runtime always wins. Otherwise this is the thread default set by
+    /// [`Runtime::set_thread_default`], if that application is still alive.
     pub fn try_current() -> Option<Rc<Self>> {
-        RUNTIMES.with(|stack| stack.borrow().last().cloned())
+        RUNTIMES
+            .with(|stack| stack.borrow().last().cloned())
+            .or_else(|| DEFAULT.with(|default| default.borrow().upgrade()))
+    }
+
+    /// Make `runtime` the thread's application for code running outside any runtime,
+    /// such as browser callbacks and tasks spawned outside Dioxus.
+    ///
+    /// Only a launcher that owns the thread's single application should call this.
+    /// It supplies an application, not a scope: global signals resolve, while
+    /// creating hooks, signals or tasks still requires an entered scope. The
+    /// reference is weak, so a dropped application is not kept alive.
+    pub fn set_thread_default(runtime: &Rc<Runtime>) {
+        DEFAULT.with(|default| *default.borrow_mut() = Rc::downgrade(runtime));
     }
 
     /// Wrap a closure so that it always runs in the runtime that is currently active

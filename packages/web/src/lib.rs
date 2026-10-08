@@ -63,6 +63,8 @@ pub async fn run(mut virtual_dom: VirtualDom, web_config: Config) -> ! {
     virtual_dom.in_runtime(document::init_document);
 
     let runtime = virtual_dom.runtime();
+    // The page runs one application; browser callbacks outside Dioxus resolve to it.
+    dioxus_core::Runtime::set_thread_default(&runtime);
 
     // If the hydrate feature is enabled, launch the client with hydration enabled
     let should_hydrate = web_config.hydrate || cfg!(feature = "hydrate");
