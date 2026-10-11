@@ -145,6 +145,11 @@ Uses `tokio::select!` to multiplex:
 
 ## Bundling
 
+The web bundler runs wasm-opt into a temporary output and copies it to the
+artifact only after the process succeeds. A launch error, failed exit, signal,
+or output-copy error fails the build. Optimizer failure never substitutes an
+unoptimized input or replaces a previous output with partial bytes.
+
 ### Bundle System
 Platform-specific packaging:
 - **Web/Server**: No special bundling, outputs to web/ directory

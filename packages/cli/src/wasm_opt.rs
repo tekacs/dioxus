@@ -121,14 +121,11 @@ impl WasmOpt {
                 err,
                 String::from_utf8_lossy(&res.stdout)
             );
-            // A failing wasm-opt execution may leave behind an empty file so copy the original file instead.
-            if self.input_path != self.output_path {
-                std::fs::copy(&self.input_path, &self.output_path).unwrap();
-            }
-        } else {
-            std::fs::copy(self.temporary_output_path.path(), &self.output_path).unwrap();
+            bail!("wasm-opt exited unsuccessfully: {}", res.status);
         }
 
+        std::fs::copy(self.temporary_output_path.path(), &self.output_path)
+            .context("Failed to publish wasm-opt output")?;
         Ok(())
     }
 }
@@ -272,6 +269,49 @@ fn publish(stage: &Path, destination: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn optimizer_publishes_only_success() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let input = directory.path().join("input.wasm");
+        for status in [9, 0] {
+            binary(directory.path(), BINARYEN_VERSION, status);
+            let path = installed_bin_path(directory.path());
+            std::fs::write(
+                &path,
+                format!("#!/bin/sh\nprintf candidate >\"$4\"\nexit {status}\n"),
+            )?;
+            for inplace in [false, true] {
+                let output = if inplace {
+                    input.clone()
+                } else {
+                    directory.path().join("output.wasm")
+                };
+                std::fs::write(&input, b"original")?;
+                std::fs::write(&output, b"original")?;
+                let optimizer = WasmOpt {
+                    path: path.clone(),
+                    input_path: input.clone(),
+                    temporary_output_path: NamedTempFile::new()?,
+                    output_path: output.clone(),
+                    cfg: WasmOptConfig::default(),
+                };
+                let result = optimizer.optimize().await;
+                assert_eq!(result.is_ok(), status == 0, "{result:?}");
+                let expected: &[u8] = if status == 0 {
+                    b"candidate"
+                } else {
+                    b"original"
+                };
+                assert_eq!(std::fs::read(&output)?, expected);
+                if !inplace {
+                    assert_eq!(std::fs::read(&input)?, b"original");
+                }
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn release_urls_share_pin() {
