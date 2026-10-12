@@ -680,8 +680,8 @@ pub fn create_wasm_jump_table(patch: &Path, cache: &HotpatchModuleCache) -> Resu
 
     // Build a mapping from Rust-mangled import function names (walrus names) to their
     // JS import names. In the base module, imports have both:
-    //   - walrus function name: `_ZN6render8electron4HOST4init43__wbg_static_accessor_HOST_82b7...E`
-    //   - import entry name:    `__wbg_static_accessor_HOST_82b74848af844c9f`
+    //   - walrus function name: `_ZN3app6bridge4HOST4init43__wbg_static_accessor_HOST_0123...E`
+    //   - import entry name:    `__wbg_static_accessor_HOST_0123456789abcdef`
     // The patch uses the walrus name as its env import name, but __saved_wbg_ wrappers
     // use the import entry name. This map bridges the two.
     let import_walrus_to_js: HashMap<&str, &str> = old
@@ -724,22 +724,13 @@ pub fn create_wasm_jump_table(patch: &Path, cache: &HotpatchModuleCache) -> Resu
         }
 
         if let Some(cast_import_name) = metadata.cast_generated_import_name_for_function(&name) {
-            let saved_name = format!("__saved_wbg_{cast_import_name}");
-            if let Some(&table_idx) = name_to_ifunc_old
-                .get(saved_name.as_str())
-                .or_else(|| name_to_ifunc_old.get(cast_import_name))
-            {
-                let old_name = if name_to_ifunc_old.contains_key(saved_name.as_str()) {
-                    saved_name.as_str()
-                } else {
-                    cast_import_name
-                };
-                validate_ifunc_type_match(cache, &new, func_id, old_name, "env cast stub")?;
+            if let Some((old_name, table_idx)) = metadata.cast_ifunc(&name, name_to_ifunc_old) {
+                validate_ifunc_type_match(cache, &new, func_id, &old_name, "env cast stub")?;
                 tracing::info!(
                     dx_src = ?crate::TraceSrc::Dev,
                     "[hotpatch] env cast stub '{}' -> '{}' -> ifunc idx {}",
                     name,
-                    saved_name,
+                    old_name,
                     table_idx
                 );
                 new.imports.delete(env_func_import);
@@ -757,7 +748,7 @@ pub fn create_wasm_jump_table(patch: &Path, cache: &HotpatchModuleCache) -> Resu
                 dx_src = ?crate::TraceSrc::Dev,
                 "[hotpatch] env cast stub '{}' mapped to '{}' but NOT in ifunc table",
                 name,
-                saved_name
+                cast_import_name
             );
         }
 
@@ -885,61 +876,13 @@ pub fn create_wasm_jump_table(patch: &Path, cache: &HotpatchModuleCache) -> Resu
         }
     }
 
-    // Rewrite the wbg_cast functions to call the indirect functions from the original module.
-    // This is necessary because wasm-bindgen uses these calls to perform dynamic type casting through
-    // the JS layer. If we don't rewrite these, they end up as calls to `breaks_if_inlined` functions
-    // which are no-ops and get rewritten by the wbindgen post-processing step.
-    //
-    // Here, we find the corresponding wbg_cast function in the old module by name and then rewrite
-    // the patch module's cast function to call the indirect function from the original module.
-    //
-    // See the wbg_cast implementation in wasm-bindgen for more details:
-    // <https://github.com/wasm-bindgen/wasm-bindgen/blob/f61a588f674304964a2062b2307edb304aed4d16/src/rt/mod.rs#L30>
-    let new_func_ids = new.funcs.iter().map(|f| f.id()).collect::<Vec<_>>();
-    for func_id in new_func_ids {
-        let Some(name) = new.funcs.get(func_id).name.as_deref() else {
-            continue;
-        };
-
-        let is_wbg_cast_family = name.contains("wasm_bindgen4__rt8wbg_cast")
-            || name.contains("wasm_bindgen4___rt8wbg_cast");
-
-        if is_wbg_cast_family && name.contains("breaks_if_inline") {
-            // `breaks_if_inlined` is wasm-bindgen's cast *descriptor*, not an
-            // identity function. Its real signature is
-            //   fn(prim1, prim2, prim3, prim4) -> WasmRet<To::Abi>
-            // i.e. the `From`-ABI primitives in, the `To`-ABI representation out,
-            // so the param and result counts differ for almost every real cast
-            // (e.g. `&str -> JsValue` is `[i32, i32] -> [i32]`). The sibling
-            // branch below rewrites every live `wbg_cast` to `call_indirect` the
-            // base module's wasm-bindgen-processed cast, which means this
-            // `breaks_if_inlined` body is dead — but wasm still validates every
-            // function body, so it must be well-typed for its own signature.
-            //
-            // The previous "push all params and fall through" rewrite only
-            // validated when `params.len() == results.len()`; for a 2-in/1-out
-            // cast it left two values on the stack where one was expected,
-            // failing `WebAssembly.compile()` with "expected 1 elements on the
-            // stack for fallthru, found 2". A single `unreachable` is the only
-            // body that validates for *any* signature (it yields a polymorphic
-            // stack) and is correct here precisely because the function is dead.
-            trap_func(&mut new, func_id);
-        } else if name_is_wbg_cast_symbol(name) {
-            let name = name.to_string();
-            let old_idx = name_to_ifunc_old.get(&name).copied().unwrap_or_else(|| {
-                tracing::debug!(
-                    "[hotpatch] wbg_cast '{}' not found in base ifunc table, routing to idx 0",
-                    name
-                );
-                0
-            });
-
-            if old_idx != 0 {
-                validate_ifunc_type_match(cache, &new, func_id, &name, "wbg_cast")?;
-            }
-            convert_func_to_ifunc_call(&mut new, ifunc_table_initializer, func_id, old_idx, name);
-        }
-    }
+    route_casts(
+        &mut new,
+        cache,
+        &metadata,
+        name_to_ifunc_old,
+        ifunc_table_initializer,
+    )?;
 
     // Wipe away the unnecessary sections
     let customs = new.customs.iter().map(|f| f.0).collect::<Vec<_>>();
@@ -1002,6 +945,83 @@ pub fn create_wasm_jump_table(patch: &Path, cache: &HotpatchModuleCache) -> Resu
         aslr_reference: 0,
         new_base_address: 0,
     })
+}
+
+/// Route wasm-bindgen casts in the patch to the casts the base module already generated.
+///
+/// A cast is `wbg_cast`, a generic wrapper, around `breaks_if_inlined`, its cast
+/// *descriptor*: the `From`-ABI primitives in, the `To`-ABI representation out. In the base
+/// module wasm-bindgen replaced every descriptor call with a call to the generated
+/// `__wbindgen_cast_*` import, recorded in the hotpatch sidecar. The patch never ran
+/// wasm-bindgen, so its descriptors are still raw.
+///
+/// 1. A wrapper the base module exports through its ifunc table calls that instead.
+/// 2. Every descriptor still called afterwards, from a wrapper the base module lacks or from a
+///    caller the compiler inlined a wrapper into, calls the base module's generated cast.
+/// 3. A called descriptor with no generated cast refuses the patch: there is no JS adapter to
+///    call, and only a full rebuild can produce one. Whether the compiler inlined the wrapper
+///    never decides between a refusal and a runtime trap.
+/// 4. An uncalled descriptor gets an `unreachable` body, the only body valid for any signature.
+///
+/// Every remap keeps its ABI check against the base target's type.
+fn route_casts(
+    new: &mut Module,
+    cache: &HotpatchModuleCache,
+    metadata: &WasmHotpatchMetadata,
+    name_to_ifunc_old: &HashMap<String, i32>,
+    table: TableId,
+) -> Result<()> {
+    let named = |module: &Module, pick: fn(&str) -> bool| {
+        module
+            .funcs
+            .iter()
+            .filter(|f| f.name.as_deref().is_some_and(pick))
+            .map(|f| (f.id(), f.name.clone().unwrap_or_default()))
+            .collect::<Vec<_>>()
+    };
+
+    for (func_id, name) in named(new, name_is_wbg_cast_symbol) {
+        if let Some(&idx) = name_to_ifunc_old.get(&name) {
+            validate_ifunc_type_match(cache, new, func_id, &name, "wbg_cast")?;
+            convert_func_to_ifunc_call(new, table, func_id, idx, name);
+        }
+    }
+
+    let called = called_functions(new);
+    for (func_id, name) in named(new, name_is_cast_descriptor) {
+        if let Some((old_name, idx)) = metadata.cast_ifunc(&name, name_to_ifunc_old) {
+            validate_ifunc_type_match(cache, new, func_id, &old_name, "cast descriptor")?;
+            convert_func_to_ifunc_call(new, table, func_id, idx, name);
+        } else if called.contains(&func_id) {
+            return Err(PatchError::InvalidModule(format!(
+                "Patch calls wasm-bindgen cast descriptor '{name}', which has no generated cast in the base module"
+            )));
+        } else {
+            trap_func(new, func_id);
+        }
+    }
+    Ok(())
+}
+
+/// Every function some local function calls directly.
+fn called_functions(module: &Module) -> HashSet<FunctionId> {
+    struct Calls<'a>(&'a mut HashSet<FunctionId>);
+    impl<'instr> walrus::ir::Visitor<'instr> for Calls<'_> {
+        fn visit_call(&mut self, call: &walrus::ir::Call) {
+            self.0.insert(call.func);
+        }
+        fn visit_return_call(&mut self, call: &walrus::ir::ReturnCall) {
+            self.0.insert(call.func);
+        }
+    }
+
+    let mut called = HashSet::new();
+    for func in module.funcs.iter() {
+        if let FunctionKind::Local(local) = &func.kind {
+            walrus::ir::dfs_in_order(&mut Calls(&mut called), local, local.entry_block());
+        }
+    }
+    called
 }
 
 fn trap_func(module: &mut Module, func_id: FunctionId) {
@@ -1969,6 +1989,12 @@ pub fn finalize_wasm_base_module(
 /// In legacy mangling the path appears as `wasm_bindgen4__rt8wbg_cast`; in v0 (default since
 /// rustc 1.97) identifiers starting with `_` get a `_` separator after their length, so `__rt`
 /// encodes as `4___rt`.
+/// Check if the name is a `wbg_cast`'s inner `breaks_if_inlined` cast descriptor.
+fn name_is_cast_descriptor(name: &str) -> bool {
+    (name.contains("wasm_bindgen4__rt8wbg_cast") || name.contains("wasm_bindgen4___rt8wbg_cast"))
+        && name.contains("breaks_if_inline")
+}
+
 fn name_is_wbg_cast_symbol(name: &str) -> bool {
     (name.contains("wasm_bindgen4__rt8wbg_cast") || name.contains("wasm_bindgen4___rt8wbg_cast"))
         && !name.contains("breaks_if_inline")
@@ -2074,6 +2100,181 @@ fn trap_func_validates_mismatched_signature() {
     wasmparser::Validator::new()
         .validate_all(&module.emit_wasm())
         .unwrap();
+}
+
+#[cfg(test)]
+mod route_casts_tests {
+    use super::*;
+    use walrus::ir::{Instr, Value};
+
+    const DESCRIPTOR: &str =
+        "_ZN12wasm_bindgen4__rt8wbg_cast17breaks_if_inlined17h1111111111111111E";
+    const WRAPPER: &str = "_ZN12wasm_bindgen4__rt8wbg_cast17h2222222222222222E";
+    const CALLER: &str = "_ZN3app5watch3new17h3333333333333333E";
+    const CAST: &str = "__wbindgen_cast_0000000000000001";
+    const SAVED: &str = "__saved_wbg___wbindgen_cast_0000000000000001";
+    const I32: ValType = ValType::I32;
+
+    /// The patch: `caller -> wrapper -> descriptor`, or `caller -> descriptor` when the
+    /// compiler inlined the wrapper. Every function is `[i32] -> [i32]`.
+    struct Patch {
+        module: Module,
+        table: TableId,
+        wrapper: FunctionId,
+        descriptor: FunctionId,
+    }
+
+    fn patch(inlined: bool) -> Patch {
+        let mut module = Module::default();
+        let table = module.tables.add_local(false, 8, None, RefType::FUNCREF);
+        let func = |module: &mut Module, name: &str, callee: Option<FunctionId>| {
+            let mut builder = FunctionBuilder::new(&mut module.types, &[I32], &[I32]);
+            builder.name(name.to_string());
+            let arg = module.locals.add(I32);
+            let mut body = builder.func_body();
+            body.local_get(arg);
+            if let Some(callee) = callee {
+                body.call(callee);
+            }
+            builder.finish(vec![arg], &mut module.funcs)
+        };
+        let descriptor = func(&mut module, DESCRIPTOR, None);
+        let wrapper = func(&mut module, WRAPPER, Some(descriptor));
+        let callee = if inlined { descriptor } else { wrapper };
+        func(&mut module, CALLER, Some(callee));
+        Patch {
+            module,
+            table,
+            wrapper,
+            descriptor,
+        }
+    }
+
+    /// The base module: the given ifunc-table entries, all `[i32] -> [i32]` unless overridden.
+    fn base(
+        entries: &[(&str, i32)],
+        ty: (Vec<ValType>, Vec<ValType>),
+    ) -> (HotpatchModuleCache, HashMap<String, i32>) {
+        let ifuncs = entries
+            .iter()
+            .map(|(name, idx)| (name.to_string(), *idx))
+            .collect::<HashMap<_, _>>();
+        let cache = HotpatchModuleCache {
+            path: PathBuf::new(),
+            symbol_ifunc_map: ifuncs.clone(),
+            symbol_ifunc_types: entries
+                .iter()
+                .map(|(name, _)| (name.to_string(), ty.clone()))
+                .collect(),
+            old_wasm: Module::default(),
+            old_bytes: Vec::new(),
+            old_exports: HashSet::new(),
+            old_imports: HashSet::new(),
+            symbol_table: HashMap::new(),
+            tls_init_data: Vec::new(),
+            tls_init_sizes: HashMap::new(),
+        };
+        (cache, ifuncs)
+    }
+
+    fn route(
+        patch: &mut Patch,
+        metadata: &WasmHotpatchMetadata,
+        entries: &[(&str, i32)],
+    ) -> Result<()> {
+        let (cache, ifuncs) = base(entries, (vec![I32], vec![I32]));
+        route_casts(&mut patch.module, &cache, metadata, &ifuncs, patch.table)
+    }
+
+    fn body(module: &Module, func: FunctionId) -> Vec<Instr> {
+        let FunctionKind::Local(local) = &module.funcs.get(func).kind else {
+            panic!("not local");
+        };
+        local
+            .block(local.entry_block())
+            .instrs
+            .iter()
+            .map(|(i, _)| i.clone())
+            .collect()
+    }
+
+    fn calls_slot(module: &Module, func: FunctionId, slot: i32) -> bool {
+        let body = body(module, func);
+        body.iter()
+            .any(|i| matches!(i, Instr::Const(c) if matches!(c.value, Value::I32(v) if v == slot)))
+            && body.iter().any(|i| matches!(i, Instr::CallIndirect(_)))
+    }
+
+    fn traps(module: &Module, func: FunctionId) -> bool {
+        matches!(body(module, func).as_slice(), [Instr::Unreachable(_)])
+    }
+
+    #[test]
+    fn inlined_descriptor_calls_the_base_cast() {
+        let mut patch = patch(true);
+        let metadata = WasmHotpatchMetadata::with_casts(&[(DESCRIPTOR, CAST)]);
+        route(&mut patch, &metadata, &[(SAVED, 5)]).unwrap();
+        assert!(calls_slot(&patch.module, patch.descriptor, 5));
+        wasmparser::Validator::new()
+            .validate_all(&patch.module.emit_wasm())
+            .unwrap();
+    }
+
+    #[test]
+    fn wrapper_absent_from_base_keeps_its_body_and_routes_the_descriptor() {
+        let mut patch = patch(false);
+        let metadata = WasmHotpatchMetadata::with_casts(&[(DESCRIPTOR, CAST)]);
+        route(&mut patch, &metadata, &[(SAVED, 5)]).unwrap();
+        assert!(
+            body(&patch.module, patch.wrapper)
+                .iter()
+                .any(|i| matches!(i, Instr::Call(c) if c.func == patch.descriptor))
+        );
+        assert!(calls_slot(&patch.module, patch.descriptor, 5));
+    }
+
+    #[test]
+    fn base_wrapper_is_called_and_its_descriptor_traps() {
+        let mut patch = patch(false);
+        route(
+            &mut patch,
+            &WasmHotpatchMetadata::default(),
+            &[(WRAPPER, 3)],
+        )
+        .unwrap();
+        assert!(calls_slot(&patch.module, patch.wrapper, 3));
+        assert!(traps(&patch.module, patch.descriptor));
+        wasmparser::Validator::new()
+            .validate_all(&patch.module.emit_wasm())
+            .unwrap();
+    }
+
+    #[test]
+    fn absent_base_cast_refuses_through_a_surviving_wrapper() {
+        let mut patch = patch(false);
+        let err = route(&mut patch, &WasmHotpatchMetadata::default(), &[]).unwrap_err();
+        assert!(err.to_string().contains("no generated cast"), "{err}");
+    }
+
+    #[test]
+    fn absent_base_cast_refuses_through_an_inlined_caller() {
+        let mut patch = patch(true);
+        let err = route(&mut patch, &WasmHotpatchMetadata::default(), &[]).unwrap_err();
+        assert!(err.to_string().contains("no generated cast"), "{err}");
+    }
+
+    #[test]
+    fn mismatched_base_cast_type_refuses() {
+        let mut patch = patch(true);
+        let metadata = WasmHotpatchMetadata::with_casts(&[(DESCRIPTOR, CAST)]);
+        let (cache, ifuncs) = base(&[(SAVED, 5)], (vec![I32, I32], vec![I32]));
+        let err =
+            route_casts(&mut patch.module, &cache, &metadata, &ifuncs, patch.table).unwrap_err();
+        assert!(
+            err.to_string().contains("Unsafe wasm hotpatch remap"),
+            "{err}"
+        );
+    }
 }
 
 /// Manually parse the data section from a wasm module

@@ -181,6 +181,34 @@ impl WasmHotpatchMetadata {
             .find_map(|old_name| name_to_ifunc_old.get(old_name).copied())
     }
 
+    /// The base module's ifunc-table entry for the wasm-bindgen cast generated from a cast
+    /// descriptor (`breaks_if_inlined`): its `__saved_wbg_` wrapper, or the bare import.
+    pub(crate) fn cast_ifunc(
+        &self,
+        function_name: &str,
+        name_to_ifunc_old: &HashMap<String, i32>,
+    ) -> Option<(String, i32)> {
+        let import = self.cast_generated_import_name_for_function(function_name)?;
+        let saved = format!("{SAVED_WBG_PREFIX}{import}");
+        if let Some(&idx) = name_to_ifunc_old.get(&saved) {
+            return Some((saved, idx));
+        }
+        let idx = *name_to_ifunc_old.get(import)?;
+        Some((import.to_string(), idx))
+    }
+
+    /// Metadata recording only the base module's generated casts: `(descriptor, import)` pairs.
+    #[cfg(test)]
+    pub(crate) fn with_casts(casts: &[(&str, &str)]) -> Self {
+        Self {
+            cast_generated_imports_by_old_name: casts
+                .iter()
+                .map(|(old, import)| (old.to_string(), import.to_string()))
+                .collect(),
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn cast_generated_import_name_for_function<'a>(
         &'a self,
         function_name: &str,
@@ -219,5 +247,15 @@ mod tests {
             metadata.cast_generated_import_name_for_function(old_name),
             Some(generated_name)
         );
+
+        let saved = format!("{SAVED_WBG_PREFIX}{generated_name}");
+        let bare = HashMap::from([(generated_name.to_string(), 7)]);
+        let both = HashMap::from([(generated_name.to_string(), 7), (saved.clone(), 9)]);
+        assert_eq!(
+            metadata.cast_ifunc(old_name, &bare),
+            Some((generated_name.to_string(), 7))
+        );
+        assert_eq!(metadata.cast_ifunc(old_name, &both), Some((saved, 9)));
+        assert_eq!(metadata.cast_ifunc(old_name, &HashMap::new()), None);
     }
 }
