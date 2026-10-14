@@ -4,6 +4,8 @@
 //! - If a mounted child has a render parent, that parent mount must still be live.
 //! - Exact fragment-child access is used for diff internals; a shorter child-mount list is a mount
 //!   table corruption bug.
+//! - Fragment sibling edges are read from each sibling mount's committed vnode, not the parent
+//!   frame's old child value: an earlier sibling may already have committed its own diff.
 
 use std::rc::Rc;
 
@@ -211,7 +213,7 @@ impl<'dom, 'ctx> PlacementResolver<'dom, 'ctx> {
                         slot.index(),
                         children.len(),
                     );
-                    self.resolve_fragment_child_site(children, &child_mounts, child_index, mount)
+                    self.resolve_fragment_child_site(&child_mounts, child_index, mount)
                         .or_else(|| Some(self.resolve_slot(parent_mount, slot)))
                 }
                 (MountedParentKind::ComponentRoot, DynamicNode::Component(_)) => {
@@ -224,33 +226,37 @@ impl<'dom, 'ctx> PlacementResolver<'dom, 'ctx> {
 
     fn resolve_fragment_child_site(
         &self,
-        children: &[VNode],
         child_mounts: &[MountId],
         position: usize,
         mount: MountId,
     ) -> Option<InsertionSite> {
+        // The parent still supplies committed sibling positions, but its old vnode values may
+        // describe descendants that an earlier sibling has already replaced. Keep every edge
+        // walk paired with the vnode committed to that sibling's actual mount.
         let following = || {
-            children
+            child_mounts
                 .iter()
-                .zip(child_mounts)
                 .skip(position + 1)
-                .filter(|(_, m)| **m != mount)
-                .find_map(|(child, &m)| {
-                    child
+                .filter(|m| **m != mount)
+                .find_map(|&m| {
+                    self.dom
+                        .current_mounted_view(m)
+                        .expect("fragment sibling mount")
                         .find_first_element(m, self.dom)
                         .map(InsertionSite::before)
                 })
         };
 
         let previous = || {
-            children
+            child_mounts
                 .iter()
-                .zip(child_mounts)
                 .take(position)
                 .rev()
-                .filter(|(_, m)| **m != mount)
-                .find_map(|(child, &m)| {
-                    child
+                .filter(|m| **m != mount)
+                .find_map(|&m| {
+                    self.dom
+                        .current_mounted_view(m)
+                        .expect("fragment sibling mount")
                         .find_last_element(m, self.dom)
                         .map(InsertionSite::after)
                 })

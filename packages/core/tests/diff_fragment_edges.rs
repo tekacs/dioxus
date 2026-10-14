@@ -13,10 +13,7 @@ fn nested_fragment_replacement_before_empty_sibling_grows() {
         } else {
             rsx! { span { "old" } }
         };
-        let children = [
-            rsx! { {nested} },
-            rsx! { if changed { "new" } },
-        ];
+        let children = [rsx! { {nested} }, rsx! { if changed { "new" } }];
         rsx! { div { {children.into_iter()} } }
     }
 
@@ -38,5 +35,70 @@ fn nested_fragment_replacement_before_empty_sibling_grows() {
         oracle.render(&mut dom);
         oracle.assert_matches(expected);
         oracle.assert_stack_clean();
+    }
+}
+
+#[test]
+fn unkeyed_nested_fragment_edge_matrix() {
+    fn app() -> Element {
+        scene(generation(), false)
+    }
+    assert_scene(app);
+}
+
+#[test]
+fn keyed_nested_fragment_edge_matrix() {
+    fn app() -> Element {
+        scene(generation(), true)
+    }
+    assert_scene(app);
+}
+
+fn assert_scene(app: fn() -> Element) {
+    let mut dom = VirtualDom::new(app);
+    let mut oracle = RendererOracle::new();
+    oracle.rebuild(&mut dom);
+    oracle.assert_matches_vdom(&dom);
+
+    // Repeat prepend, reorder, truncate, clear and repopulate while nested
+    // siblings independently replace static, text, multi-root and empty output.
+    for _ in 0..36 {
+        dom.mark_dirty(ScopeId::APP);
+        oracle.render(&mut dom);
+        oracle.assert_matches_vdom(&dom);
+        oracle.assert_stack_clean();
+    }
+}
+
+fn scene(phase: usize, keyed: bool) -> Element {
+    let order: &[usize] = match phase % 6 {
+        0 => &[0, 1, 2],
+        1 => &[3, 0, 1, 2],
+        2 => &[2, 0, 3, 1],
+        3 => &[0, 2],
+        4 => &[],
+        _ => &[4, 0, 1, 2, 3],
+    };
+    let children = order.iter().map(|&id| {
+        let nested = [content(phase + id, id), content(phase * 2 + id + 1, id)];
+        let nested = rsx! {
+            {nested.into_iter().map(|node| rsx! { {node} })}
+        };
+        if keyed {
+            rsx! { Fragment { key: "{id}", {nested} } }
+        } else {
+            nested
+        }
+    });
+    rsx! { div { "before" {children} "after" } }
+}
+
+fn content(shape: usize, id: usize) -> Element {
+    match shape % 5 {
+        0 => VNode::empty(),
+        1 => rsx! { span { "{id}" } },
+        2 => rsx! { "text-{id}" },
+        3 => rsx! { em { "{id}" } strong { "tail" } },
+        _ => rsx! { if id % 2 == 0 { "even" } },
     }
 }
