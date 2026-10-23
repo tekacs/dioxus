@@ -38,6 +38,54 @@ fn nested_fragment_replacement_before_empty_sibling_grows() {
     }
 }
 
+/// Removing a nested conditional commits earlier fragment children before a
+/// following component with changed props resolves its own insertion site.
+#[test]
+fn recursive_fragment_edges_after_conditional_component_removal() {
+    fn app() -> Element {
+        let changed = generation() % 2 == 1;
+        rsx! {
+            Panel {
+                if !changed {
+                    span { "head" }
+                    if !changed { Label { text: "nested" } }
+                    if !changed { Label { text: "tail" } }
+                }
+                if true { Label { text: if changed { "new" } else { "old" } } }
+            }
+        }
+    }
+
+    fn initial() -> Element {
+        rsx! { div { span { "head" } "nested" "tail" "old" } }
+    }
+
+    fn changed() -> Element {
+        rsx! { div { "new" } }
+    }
+
+    let mut dom = VirtualDom::new(app);
+    let mut oracle = RendererOracle::new();
+    oracle.rebuild(&mut dom);
+    oracle.assert_matches(initial);
+    for expected in [changed, initial, changed, initial] {
+        dom.mark_dirty(ScopeId::APP);
+        oracle.render(&mut dom);
+        oracle.assert_matches(expected);
+        oracle.assert_stack_clean();
+    }
+}
+
+#[component]
+fn Panel(children: Element) -> Element {
+    rsx! { div { {children} } }
+}
+
+#[component]
+fn Label(text: String) -> Element {
+    rsx! { if !text.is_empty() { "{text}" } }
+}
+
 #[test]
 fn unkeyed_nested_fragment_edge_matrix() {
     fn app() -> Element {

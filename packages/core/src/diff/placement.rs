@@ -242,7 +242,12 @@ impl<'dom, 'ctx> PlacementResolver<'dom, 'ctx> {
                     self.dom
                         .current_mounted_view(m)
                         .expect("fragment sibling mount")
-                        .find_first_element(m, self.dom)
+                        .find_element_in_roots(
+                            m,
+                            self.dom,
+                            EdgeScan::placement(self.dom),
+                            ElementEdge::First,
+                        )
                         .map(InsertionSite::before)
                 })
         };
@@ -257,7 +262,12 @@ impl<'dom, 'ctx> PlacementResolver<'dom, 'ctx> {
                     self.dom
                         .current_mounted_view(m)
                         .expect("fragment sibling mount")
-                        .find_last_element(m, self.dom)
+                        .find_element_in_roots(
+                            m,
+                            self.dom,
+                            EdgeScan::placement(self.dom),
+                            ElementEdge::Last,
+                        )
                         .map(InsertionSite::after)
                 })
         };
